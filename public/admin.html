@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#080808" />
+  <title>Cactus TV 管理后台</title>
+  <link rel="icon" href="/assets/cactus.svg" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-word">CACTUS</span><span class="brand-tv">ADMIN</span></a>
+    <div></div>
+    <div class="top-actions">
+      <button id="forgetAdminKey" class="secondary-button">清除管理密钥</button>
+      <a class="account-button" href="/">返回前台</a>
+    </div>
+  </header>
+
+  <main class="admin-main">
+    <section class="admin-hero">
+      <div><span class="eyebrow">ADMIN</span><h1>管理后台</h1></div>
+      <button id="refreshAll" class="secondary-button">刷新</button>
+    </section>
+    <div id="adminNotice" class="notice hidden"></div>
+
+    <nav class="admin-tabs">
+      <button class="admin-tab active" data-panel="providers">数据源</button>
+      <button class="admin-tab" data-panel="settings">站点设置</button>
+      <button class="admin-tab" data-panel="subtitles">字幕</button>
+    </nav>
+
+    <section id="panel-providers" class="admin-panel active">
+      <div class="admin-grid">
+        <div class="admin-card">
+          <h2>接口配置</h2>
+          <form id="providerForm" class="admin-form">
+            <input id="providerOriginalId" type="hidden" />
+            <label>唯一 ID<input id="providerId" required placeholder="source-1" /></label>
+            <label>显示名称<input id="providerName" required placeholder="数据源名称" /></label>
+            <label>Apple CMS 接口地址<input id="providerUrl" type="url" required placeholder="https://example.com/api.php/provide/vod/" /></label>
+            <div class="form-row">
+              <label>优先级<input id="providerPriority" type="number" value="0" /></label>
+              <label>媒体域名白名单<input id="providerHosts" placeholder="cdn.example.com, media.example.com" /></label>
+            </div>
+            <label>请求头 JSON<textarea id="providerHeaders" rows="4" placeholder='{"Referer":"https://example.com/"}'>{}</textarea></label>
+            <label class="check-row"><input id="providerEnabled" type="checkbox" checked />启用数据源</label>
+            <label class="check-row"><input id="providerProxy" type="checkbox" />启用播放代理</label>
+            <div class="form-row">
+              <button class="primary-button" type="submit">保存</button>
+              <button id="providerReset" class="secondary-button" type="button">清空</button>
+            </div>
+          </form>
+          <p class="muted">白名单只填域名，不填协议和路径。</p>
+        </div>
+
+        <div class="admin-card">
+          <div class="section-heading">
+            <div><h2>现有数据源</h2></div>
+            <button id="testAll" class="secondary-button">全部测速</button>
+          </div>
+          <div id="providerList" class="admin-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-settings" class="admin-panel">
+      <div class="admin-card">
+        <h2>站点设置</h2>
+        <form id="settingsForm" class="admin-form">
+          <label>站点名称<input id="siteName" /></label>
+          <label>首页公告<textarea id="homeNotice" rows="4"></textarea></label>
+          <button class="primary-button" type="submit">保存设置</button>
+        </form>
+        <div class="code-note">ADMIN_TOKEN、TMDB_BEARER_TOKEN 等密钥只在 Cloudflare Variables and Secrets 中配置。</div>
+      </div>
+    </section>
+
+    <section id="panel-subtitles" class="admin-panel">
+      <div class="admin-grid">
+        <div class="admin-card">
+          <h2>添加字幕</h2>
+          <form id="subtitleForm" class="admin-form">
+            <label>内容 Key<input id="subtitleItemKey" required placeholder="provider-id:vod-id" /></label>
+            <label>字幕名称<input id="subtitleName" required placeholder="简体中文" /></label>
+            <div class="form-row">
+              <label>语言<input id="subtitleLang" value="zh" /></label>
+              <label>格式<select id="subtitleFormat"><option value="vtt">VTT</option><option value="srt">SRT</option></select></label>
+            </div>
+            <label>字幕 HTTPS 地址<input id="subtitleUrl" type="url" required /></label>
+            <button class="primary-button" type="submit">添加字幕</button>
+          </form>
+        </div>
+        <div class="admin-card"><h2>字幕列表</h2><div id="subtitleList" class="admin-list"></div></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="adminKeyDialog" class="auth-dialog">
+    <form id="adminKeyForm" class="auth-form">
+      <span class="eyebrow">ADMIN KEY</span>
+      <h2>输入管理密钥</h2>
+      <p class="muted">密钥保存在当前标签页，关闭后清除。</p>
+      <label>ADMIN_TOKEN<input id="adminKeyInput" type="password" autocomplete="off" minlength="16" required /></label>
+      <button class="primary-button" type="submit">进入后台</button>
+      <div id="adminKeyMessage" class="form-message"></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/js/admin.js"></script>
+</body>
+</html>
