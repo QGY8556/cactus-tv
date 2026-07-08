@@ -3,7 +3,7 @@ const els = {
   notice: $('#adminNotice'), toast: $('#toast'), providerForm: $('#providerForm'), providerOriginalId: $('#providerOriginalId'), providerId: $('#providerId'),
   providerName: $('#providerName'), providerUrl: $('#providerUrl'), providerPriority: $('#providerPriority'), providerHosts: $('#providerHosts'), providerHeaders: $('#providerHeaders'),
   providerEnabled: $('#providerEnabled'), providerProxy: $('#providerProxy'), providerReset: $('#providerReset'), providerList: $('#providerList'), testAll: $('#testAll'),
-  settingsForm: $('#settingsForm'), siteName: $('#siteName'), homeNotice: $('#homeNotice'),
+  settingsForm: $('#settingsForm'), siteName: $('#siteName'), homeNotice: $('#homeNotice'), metadataSource: $('#metadataSource'),
   subtitleForm: $('#subtitleForm'), subtitleItemKey: $('#subtitleItemKey'), subtitleName: $('#subtitleName'), subtitleLang: $('#subtitleLang'), subtitleFormat: $('#subtitleFormat'), subtitleUrl: $('#subtitleUrl'), subtitleList: $('#subtitleList'),
   refreshAll: $('#refreshAll'), forgetAdminKey: $('#forgetAdminKey'), adminKeyDialog: $('#adminKeyDialog'), adminKeyForm: $('#adminKeyForm'), adminKeyInput: $('#adminKeyInput'), adminKeyMessage: $('#adminKeyMessage'),
 };
@@ -121,6 +121,7 @@ async function loadSettings() {
   const settings = payload.settings || {};
   els.siteName.value = settings.site_name || 'Cactus TV';
   els.homeNotice.value = settings.home_notice || '';
+  els.metadataSource.value = ['auto', 'douban', 'tmdb'].includes(settings.metadata_source) ? settings.metadata_source : 'auto';
 }
 async function loadSubtitles() {
   const payload = await request('/api/admin/subtitles');
@@ -196,7 +197,7 @@ els.testAll.addEventListener('click', () => testProviders());
 els.settingsForm.addEventListener('submit', async event => {
   event.preventDefault();
   try {
-    await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ site_name: els.siteName.value.trim(), home_notice: els.homeNotice.value.trim() }) });
+    await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ site_name: els.siteName.value.trim(), home_notice: els.homeNotice.value.trim(), metadata_source: els.metadataSource.value }) });
     toast('设置已保存');
   } catch (error) { handleError(error); }
 });
