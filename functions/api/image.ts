@@ -10,7 +10,7 @@ const DOUBAN_IMAGE_HOSTS = /(^|\.)doubanio\.com$/i;
 const NUMERIC_ID = /^\d{5,12}$/;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_METADATA_BYTES = 1024 * 1024;
-const CACHE_REVISION = '12';
+const CACHE_REVISION = '15';
 const POSTER_LOOKUP_REVISION = '3';
 const IMAGE_ACCEPT = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
 const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
@@ -100,13 +100,23 @@ function addCandidate(output: URL[], seen: Set<string>, value: URL | null): void
   output.push(value);
 }
 
-function imageCandidates(source: URL): URL[] {
+function imageCandidates(source: URL, size: 'card' | 'detail' | 'hero' = 'card'): URL[] {
   const output: URL[] = [];
   const seen = new Set<string>();
   const clean = new URL(source.toString());
   clean.protocol = 'https:';
   clean.hash = '';
 
+  const preferred = new URL(clean.toString());
+  if (/\/view\/photo\/[^/]*ratio_poster\//i.test(preferred.pathname)) {
+    const target = size === 'card' ? 'm_ratio_poster' : 'l_ratio_poster';
+    preferred.pathname = preferred.pathname.replace(/\/view\/photo\/[^/]*ratio_poster\//i, `/view/photo/${target}/`);
+  } else if (/\/view\/photo\/(?:raw|xl|l|m|s|sqx|sqxs)\/public\//i.test(preferred.pathname)) {
+    const target = size === 'card' ? 'm' : 'l';
+    preferred.pathname = preferred.pathname.replace(/\/view\/photo\/(?:raw|xl|l|m|s|sqx|sqxs)\/public\//i, `/view/photo/${target}/public/`);
+  }
+  preferred.search = '';
+  addCandidate(output, seen, preferred);
   addCandidate(output, seen, new URL(clean.toString()));
 
   const withoutQuery = new URL(clean.toString());
@@ -115,13 +125,17 @@ function imageCandidates(source: URL): URL[] {
 
   const paths = new Set<string>([clean.pathname]);
   if (/\/view\/photo\/[^/]*ratio_poster\//i.test(clean.pathname)) {
-    for (const size of ['l_ratio_poster', 'm_ratio_poster', 's_ratio_poster']) {
-      paths.add(clean.pathname.replace(/\/view\/photo\/[^/]*ratio_poster\//i, `/view/photo/${size}/`));
+    const posterSizes = size === 'card'
+      ? ['m_ratio_poster', 's_ratio_poster', 'l_ratio_poster']
+      : ['l_ratio_poster', 'm_ratio_poster', 's_ratio_poster'];
+    for (const posterSize of posterSizes) {
+      paths.add(clean.pathname.replace(/\/view\/photo\/[^/]*ratio_poster\//i, `/view/photo/${posterSize}/`));
     }
   }
   if (/\/view\/photo\/(?:raw|xl|l|m|s|sqx|sqxs)\/public\//i.test(clean.pathname)) {
-    for (const size of ['l', 'm', 's', 'raw']) {
-      paths.add(clean.pathname.replace(/\/view\/photo\/(?:raw|xl|l|m|s|sqx|sqxs)\/public\//i, `/view/photo/${size}/public/`));
+    const photoSizes = size === 'card' ? ['m', 's', 'l'] : ['l', 'm', 'raw'];
+    for (const photoSize of photoSizes) {
+      paths.add(clean.pathname.replace(/\/view\/photo\/(?:raw|xl|l|m|s|sqx|sqxs)\/public\//i, `/view/photo/${photoSize}/public/`));
     }
   }
   if (/\.webp$/i.test(clean.pathname)) paths.add(clean.pathname.replace(/\.webp$/i, '.jpg'));
@@ -174,7 +188,7 @@ async function fetchVerifiedImage(url: URL, deadline: number): Promise<ImageResu
   for (const headers of headerAttempts) {
     const remaining = deadline - Date.now();
     if (remaining <= 150) return null;
-    const fetched = await fetchImageOnce(url, headers, Math.min(2_500, remaining));
+    const fetched = await fetchImageOnce(url, headers, Math.min(1_800, remaining));
     if (!fetched.response || !fetched.body) continue;
     if (fetched.body.byteLength < 64 || fetched.body.byteLength > MAX_IMAGE_BYTES) continue;
 
@@ -185,10 +199,10 @@ async function fetchVerifiedImage(url: URL, deadline: number): Promise<ImageResu
   return null;
 }
 
-async function firstVerifiedImage(candidates: URL[]): Promise<ImageResult | null> {
+async function firstVerifiedImage(candidates: URL[], budgetMs = 5_000): Promise<ImageResult | null> {
   const shortlist = candidates.slice(0, 14);
   if (!shortlist.length) return null;
-  const deadline = Date.now() + 8_500;
+  const deadline = Date.now() + budgetMs;
 
   const first = await fetchVerifiedImage(shortlist[0], deadline);
   if (first) return first;
@@ -387,34 +401,26 @@ async function currentDoubanPoster(
   return poster;
 }
 
-function mergeCandidates(...groups: URL[][]): URL[] {
-  const output: URL[] = [];
-  const seen = new Set<string>();
-  for (const group of groups) {
-    for (const candidate of group) addCandidate(output, seen, candidate);
-  }
-  return output;
-}
-
 export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request }) => {
   const requestUrl = new URL(request.url);
   const source = requestUrl.searchParams.get('url') || '';
   const rawId = requestUrl.searchParams.get('id') || '';
   const doubanId = NUMERIC_ID.test(rawId) ? rawId : '';
   const mediaType = requestUrl.searchParams.get('kind') || '';
+  const requestedSize = requestUrl.searchParams.get('size');
+  const size: 'card' | 'detail' | 'hero' = requestedSize === 'hero' || requestedSize === 'detail'
+    ? requestedSize
+    : 'card';
   const bypassCache = requestUrl.searchParams.has('retry') || requestUrl.searchParams.get('bypass') === '1';
 
   const sourceUrl = doubanImageUrl(source);
   if (!sourceUrl) return noStore('Bad or disallowed image URL', 400);
 
   const cache = caches.default;
-  const officialPoster = doubanId
-    ? await currentDoubanPoster(cache, requestUrl.origin, doubanId, mediaType, bypassCache)
-    : null;
-
-  const targetUrl = officialPoster || sourceUrl;
   const imageCacheUrl = new URL('/__cactus/douban-image', requestUrl.origin);
-  imageCacheUrl.searchParams.set('url', targetUrl.toString());
+  imageCacheUrl.searchParams.set('url', sourceUrl.toString());
+  imageCacheUrl.searchParams.set('size', size);
+  if (doubanId) imageCacheUrl.searchParams.set('id', doubanId);
   imageCacheUrl.searchParams.set('rev', CACHE_REVISION);
   const imageCacheKey = new Request(imageCacheUrl.toString(), { method: 'GET' });
 
@@ -423,19 +429,34 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request }
     if (cached) return cached;
   }
 
-  const officialCandidates = officialPoster ? imageCandidates(officialPoster) : [];
-  const sourceCandidates = imageCandidates(sourceUrl);
-  const candidates = mergeCandidates(officialCandidates, sourceCandidates);
-  const result = await firstVerifiedImage(candidates);
-  if (!result) return noStore('Douban image unavailable', 502);
+  // The list API already supplies a Douban poster. Trying it first removes an
+  // extra metadata round-trip for every card. Subject-page lookup is retained
+  // only as a reliability fallback when that URL is stale or unavailable.
+  let result = await firstVerifiedImage(imageCandidates(sourceUrl, size), 4_800);
+  let sourceName = 'douban-list';
 
-  const sourceName = officialPoster && result.url.toString() !== sourceUrl.toString()
-    ? 'douban-subject'
-    : 'douban-list';
+  if (!result && doubanId) {
+    const officialPoster = await currentDoubanPoster(cache, requestUrl.origin, doubanId, mediaType, bypassCache);
+    if (officialPoster) {
+      result = await firstVerifiedImage(imageCandidates(officialPoster, size), 4_800);
+      if (result) sourceName = 'douban-subject';
+    }
+  }
+
+  if (!result) {
+    return new Response('Douban image unavailable', {
+      status: 502,
+      headers: {
+        'cache-control': 'public, max-age=60, s-maxage=300',
+        'content-type': 'text/plain; charset=utf-8',
+      },
+    });
+  }
+
   const headers = new Headers();
   headers.set('content-type', result.type);
   headers.set('content-length', String(result.body.byteLength));
-  headers.set('cache-control', 'public, max-age=600, s-maxage=86400, stale-while-revalidate=3600');
+  headers.set('cache-control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=2592000');
   headers.set('x-content-type-options', 'nosniff');
   headers.set('x-cactus-poster-source', sourceName);
 
