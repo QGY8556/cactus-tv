@@ -150,7 +150,7 @@ README.md
 
 ### 三、 GitHub
 
-在 GitHub fork本项目即可
+其实仅在 GitHub fork本项目即可，也可以download本项目后一一上传文件
 
 
 ### 四、创建 Cloudflare Pages 项目
