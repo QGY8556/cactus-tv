@@ -23,30 +23,38 @@ let featuredItem = null;
 els.historyToggle.checked = settings.recordHistory;
 els.nativeHlsToggle.checked = settings.preferNativeHls;
 els.resumeToggle.checked = settings.resumePlayback;
-els.heroArtwork.addEventListener('error', () => {
-  const proxy = els.heroArtwork.dataset.proxySrc || '';
-  if (proxy && !els.heroArtwork.dataset.proxyTried) {
-    els.heroArtwork.dataset.proxyTried = '1';
-    els.heroArtwork.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
-    return;
+function tryNextImageSource(img) {
+  const original = img.dataset.originalSrc || '';
+  if (original && !img.dataset.originalTried) {
+    img.dataset.originalTried = '1';
+    img.src = original;
+    return true;
   }
+
+  const proxy = img.dataset.proxySrc || '';
+  if (proxy && !img.dataset.proxyRetried) {
+    img.dataset.proxyRetried = '1';
+    img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
+    return true;
+  }
+  return false;
+}
+
+els.heroArtwork.addEventListener('error', () => {
+  if (tryNextImageSource(els.heroArtwork)) return;
   els.hero.classList.remove('poster-mode');
   els.heroArtwork.removeAttribute('src');
   delete els.heroArtwork.dataset.proxySrc;
-  delete els.heroArtwork.dataset.proxyTried;
+  delete els.heroArtwork.dataset.originalSrc;
+  delete els.heroArtwork.dataset.originalTried;
+  delete els.heroArtwork.dataset.proxyRetried;
 });
 
 // Register before any cards are rendered so cached failures cannot escape the fallback.
 document.addEventListener('error', event => {
   const img = event.target;
   if (!(img instanceof HTMLImageElement) || !img.dataset.fallback) return;
-
-  const proxy = img.dataset.proxySrc || '';
-  if (proxy && !img.dataset.proxyTried) {
-    img.dataset.proxyTried = '1';
-    img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
-    return;
-  }
+  if (tryNextImageSource(img)) return;
 
   const isDetailCover = img.classList.contains('detail-cover');
   const isDetailThumb = img.classList.contains('detail-thumb');
@@ -89,7 +97,7 @@ function proxyImage(url, item = null) {
   try {
     const parsed = new URL(value);
     if (/(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
-      const params = new URLSearchParams({ rev: '5', url: value });
+      const params = new URLSearchParams({ rev: '6', url: value });
       const doubanId = doubanIdOf(item);
       const title = String(item?.title || item?.name || item?.douban?.title || '').trim();
       if (doubanId) params.set('id', doubanId);
@@ -113,7 +121,7 @@ function imageAttributes(url, fallback = '', item = null) {
   const proxy = proxyImage(original, item);
   const src = proxy || original;
   if (!src) return '';
-  return `src="${escapeHtml(src)}"${proxy ? ` data-proxy-src="${escapeHtml(proxy)}"` : ''}${fallback ? ` data-fallback="${escapeHtml(fallback)}"` : ''}`;
+  return `src="${escapeHtml(src)}"${proxy ? ` data-proxy-src="${escapeHtml(proxy)}" data-original-src="${escapeHtml(original)}"` : ''}${fallback ? ` data-fallback="${escapeHtml(fallback)}"` : ''}`;
 }
 function keyOf(item) { return item.key || `${item.provider}:${item.id}`; }
 function titleOf(item) { return item.name || item.title || '未命名'; }
@@ -162,7 +170,9 @@ function renderHero(item) {
   els.hero.classList.remove('poster-mode');
   els.heroArtwork.removeAttribute('src');
   delete els.heroArtwork.dataset.proxySrc;
-  delete els.heroArtwork.dataset.proxyTried;
+  delete els.heroArtwork.dataset.originalSrc;
+  delete els.heroArtwork.dataset.originalTried;
+  delete els.heroArtwork.dataset.proxyRetried;
 
   if (!item) {
     els.heroBackdrop.style.backgroundImage = 'radial-gradient(circle at 72% 28%, #3c0a0e 0, #18090b 25%, #090909 62%)';
@@ -182,8 +192,10 @@ function renderHero(item) {
 
   if (!backdrop && poster) {
     els.hero.classList.add('poster-mode');
+    const heroOriginal = safeImage(item.poster || item.pic || item.tmdb?.poster);
     els.heroArtwork.src = poster;
-    els.heroArtwork.dataset.proxySrc = proxyImage(item.poster || item.pic || item.tmdb?.poster, item);
+    els.heroArtwork.dataset.proxySrc = proxyImage(heroOriginal, item);
+    els.heroArtwork.dataset.originalSrc = heroOriginal;
     els.heroArtwork.alt = titleOf(item);
   }
 
