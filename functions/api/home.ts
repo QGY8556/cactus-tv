@@ -46,7 +46,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ env }) =>
   const source = resolveMetadataSource(preference, env);
 
   if (source === 'tmdb' && !env.TMDB_BEARER_TOKEN) {
-    return ok({ metadataSource: source, sections: [], notice: homeNotice || '已选择 TMDB，但还没有配置 TMDB_BEARER_TOKEN。' });
+    return ok({ metadataSource: source, sections: [], notice: homeNotice || '已选择 TMDB，但还没有配置 TMDB_BEARER_TOKEN。' }, 200, { 'cache-control': 'public, max-age=60, s-maxage=60' });
   }
 
   let sections = source === 'tmdb' ? await tmdbSections(env) : await doubanSections();
@@ -61,5 +61,5 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ env }) =>
     metadataSource: actualSource,
     notice: homeNotice || (!sections.length ? `${actualSource === 'tmdb' ? 'TMDB' : '豆瓣'}数据暂时不可用，可以直接搜索。` : ''),
     sections,
-  });
+  }, 200, { 'cache-control': 'public, max-age=300, s-maxage=900, stale-while-revalidate=86400' });
 };

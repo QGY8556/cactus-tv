@@ -71,5 +71,5 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     lang: String(item.vod_lang ?? ''), content: tmdb?.overview || String(item.vod_content ?? item.vod_blurb ?? '').replace(/<[^>]+>/g, '').slice(0, 3000),
     director: String(item.vod_director ?? ''), actors: String(item.vod_actor ?? ''), lines: parseLines(String(item.vod_play_from ?? ''), String(item.vod_play_url ?? ''), provider),
     tmdb, douban, metadataSource: source, subtitles, proxyEnabled: provider.proxyEnabled,
-  }});
+  }}, 200, { 'cache-control': 'private, max-age=60' });
 };

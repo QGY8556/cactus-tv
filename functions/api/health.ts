@@ -14,5 +14,5 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ env }) =>
     adminReady: adminConfigured(env),
     privateMode: true,
     providers: providers.map(({ id, name, proxyEnabled }) => ({ id, name, proxyEnabled })),
-  });
+  }, 200, { 'cache-control': 'public, max-age=30, s-maxage=60, stale-while-revalidate=300' });
 };

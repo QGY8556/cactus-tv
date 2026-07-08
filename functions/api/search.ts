@@ -12,7 +12,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
   const query = new URL(request.url).searchParams.get('q')?.trim() || '';
   if (!query || query.length > 80) throw new HttpError(400, '请输入 1—80 个字符的关键词', 'INVALID_QUERY');
   const providers = await getProviders(env);
-  if (!providers.length) return ok({ items: [], errors: [], query });
+  if (!providers.length) return ok({ items: [], errors: [], query }, 200, { 'cache-control': 'public, max-age=30, s-maxage=30' });
 
   const metadataPromise = searchTmdb(query, env);
   const doubanPromise = doubanSearch(query, env);
@@ -59,5 +59,5 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
       pic: tmdb?.poster || item.pic, year: item.year || tmdb?.year || '', tmdb, douban: douban && cleanName(douban.title) === cleanName(item.name) ? douban : null,
       sourceCount: item.sources.length };
   }).sort((a, b) => (b.sourceCount - a.sourceCount) || ((b.tmdb?.popularity || 0) - (a.tmdb?.popularity || 0)));
-  return ok({ items: items.slice(0, 80), errors, query });
+  return ok({ items: items.slice(0, 80), errors, query }, 200, { 'cache-control': 'public, max-age=30, s-maxage=60, stale-while-revalidate=120' });
 };
