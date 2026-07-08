@@ -24,9 +24,38 @@ els.historyToggle.checked = settings.recordHistory;
 els.nativeHlsToggle.checked = settings.preferNativeHls;
 els.resumeToggle.checked = settings.resumePlayback;
 els.heroArtwork.addEventListener('error', () => {
+  const proxy = els.heroArtwork.dataset.proxySrc || '';
+  if (proxy && !els.heroArtwork.dataset.proxyTried) {
+    els.heroArtwork.dataset.proxyTried = '1';
+    els.heroArtwork.src = proxy;
+    return;
+  }
   els.hero.classList.remove('poster-mode');
   els.heroArtwork.removeAttribute('src');
+  delete els.heroArtwork.dataset.proxySrc;
+  delete els.heroArtwork.dataset.proxyTried;
 });
+
+// Register before any cards are rendered so cached failures cannot escape the fallback.
+document.addEventListener('error', event => {
+  const img = event.target;
+  if (!(img instanceof HTMLImageElement) || !img.dataset.fallback) return;
+
+  const proxy = img.dataset.proxySrc || '';
+  if (proxy && !img.dataset.proxyTried) {
+    img.dataset.proxyTried = '1';
+    img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
+    return;
+  }
+
+  const isDetailCover = img.classList.contains('detail-cover');
+  const isDetailThumb = img.classList.contains('detail-thumb');
+  const fallback = Object.assign(document.createElement('div'), {
+    className: isDetailCover ? 'detail-cover-fallback' : isDetailThumb ? 'detail-thumb detail-thumb-fallback' : 'poster-fallback',
+    textContent: img.dataset.fallback || 'C',
+  });
+  img.replaceWith(fallback);
+}, true);
 
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
@@ -37,14 +66,37 @@ function safeImage(url) {
 
   try {
     const parsed = new URL(value);
+    if (parsed.protocol === 'http:' && /(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
+      parsed.protocol = 'https:';
+      return parsed.toString();
+    }
+    return parsed.toString();
+  } catch {
+    return '';
+  }
+}
+
+function proxyImage(url) {
+  const value = safeImage(url);
+  if (!value) return '';
+
+  try {
+    const parsed = new URL(value);
     if (/(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
-      return `/api/image?rev=2&url=${encodeURIComponent(value)}`;
+      return `/api/image?rev=3&url=${encodeURIComponent(value)}`;
     }
   } catch {
     return '';
   }
 
-  return value;
+  return '';
+}
+
+function imageAttributes(url, fallback = '') {
+  const src = safeImage(url);
+  const proxy = proxyImage(url);
+  if (!src) return '';
+  return `src="${escapeHtml(src)}"${proxy ? ` data-proxy-src="${escapeHtml(proxy)}"` : ''}${fallback ? ` data-fallback="${escapeHtml(fallback)}"` : ''}`;
 }
 function keyOf(item) { return item.key || `${item.provider}:${item.id}`; }
 function titleOf(item) { return item.name || item.title || '未命名'; }
@@ -92,6 +144,8 @@ function renderHero(item) {
   featuredItem = item || null;
   els.hero.classList.remove('poster-mode');
   els.heroArtwork.removeAttribute('src');
+  delete els.heroArtwork.dataset.proxySrc;
+  delete els.heroArtwork.dataset.proxyTried;
 
   if (!item) {
     els.heroBackdrop.style.backgroundImage = 'radial-gradient(circle at 72% 28%, #3c0a0e 0, #18090b 25%, #090909 62%)';
@@ -112,6 +166,7 @@ function renderHero(item) {
   if (!backdrop && poster) {
     els.hero.classList.add('poster-mode');
     els.heroArtwork.src = poster;
+    els.heroArtwork.dataset.proxySrc = proxyImage(item.poster || item.pic || item.tmdb?.poster);
     els.heroArtwork.alt = titleOf(item);
   }
 
@@ -125,9 +180,13 @@ function renderHero(item) {
 
 function cardHtml(item, index, context = 'results') {
   const name = titleOf(item);
-  const explicitBackdrop = safeImage(item.backdrop || item.tmdb?.backdrop);
-  const portraitVisual = safeImage(item.pic || item.poster || item.tmdb?.poster || item.backdrop || item.tmdb?.backdrop);
-  const visual = explicitBackdrop || portraitVisual;
+  const explicitBackdropSource = item.backdrop || item.tmdb?.backdrop || '';
+  const portraitSource = item.pic || item.poster || item.tmdb?.poster || item.backdrop || item.tmdb?.backdrop || '';
+  const explicitBackdrop = safeImage(explicitBackdropSource);
+  const portraitVisual = safeImage(portraitSource);
+  const preferPortrait = window.matchMedia('(max-width: 1024px)').matches;
+  const visualSource = preferPortrait ? (portraitSource || explicitBackdropSource) : (explicitBackdropSource || portraitSource);
+  const visual = safeImage(visualSource);
   const portraitOnly = !explicitBackdrop && Boolean(portraitVisual);
   const key = keyOf(item);
   const rating = Number(item.tmdb?.rating || item.rating || item.douban?.rating || 0);
@@ -137,7 +196,7 @@ function cardHtml(item, index, context = 'results') {
   const fallback = name.trim().slice(0, 1).toUpperCase() || 'C';
 
   const image = visual
-    ? `<picture>${portraitVisual && portraitVisual !== explicitBackdrop ? `<source media="(max-width: 1024px)" srcset="${escapeHtml(portraitVisual)}">` : ''}<img loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-fallback="${escapeHtml(fallback)}" src="${escapeHtml(visual)}" alt="${escapeHtml(name)}"></picture>`
+    ? `<img loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" ${imageAttributes(visualSource, fallback)} alt="${escapeHtml(name)}">`
     : `<div class="poster-fallback">${escapeHtml(fallback)}</div>`;
 
   const posterClass = portraitOnly ? 'poster poster-portrait-source' : 'poster';
@@ -182,26 +241,6 @@ function bindCards(container, items, context) {
     event.preventDefault();
     activateCard(card, event);
   });
-  container.addEventListener('error', event => {
-    const img = event.target;
-    if (!(img instanceof HTMLImageElement)) return;
-    const picture = img.closest('picture');
-
-    if (!img.dataset.retried && img.src.includes('/api/image')) {
-      img.dataset.retried = '1';
-      picture?.querySelectorAll('source').forEach(source => source.remove());
-      const retryUrl = new URL(img.src, location.origin);
-      retryUrl.searchParams.set('_retry', String(Date.now()));
-      img.src = retryUrl.toString();
-      return;
-    }
-
-    const fallback = Object.assign(document.createElement('div'), {
-      className: 'poster-fallback',
-      textContent: img.dataset.fallback || 'C',
-    });
-    (picture || img).replaceWith(fallback);
-  }, true);
 }
 function render(items, title, kicker) {
   const list = items || [];
@@ -318,12 +357,12 @@ async function openDetail(item, sourceOverride = null) {
     }).join('');
 
     els.detailContent.innerHTML = `<section class="detail-masthead">
-      ${cover ? `<img class="detail-cover" referrerpolicy="no-referrer" src="${escapeHtml(cover)}" alt="">` : '<div class="detail-cover-fallback">C</div>'}
+      ${cover ? `<img class="detail-cover" referrerpolicy="no-referrer" ${imageAttributes(detail.backdrop || detail.tmdb?.backdrop || detail.pic, 'C')} alt="">` : '<div class="detail-cover-fallback">C</div>'}
       <div class="detail-masthead-shade"></div>
     </section>
     <div class="detail-main">
       <div class="detail-title-row">
-        ${poster ? `<img class="detail-thumb" referrerpolicy="no-referrer" src="${escapeHtml(poster)}" alt="${escapeHtml(detail.name)}">` : ''}
+        ${poster ? `<img class="detail-thumb" referrerpolicy="no-referrer" ${imageAttributes(detail.pic, 'C')} alt="${escapeHtml(detail.name)}">` : ''}
         <div class="detail-title-copy">
           <h2>${escapeHtml(detail.name)}</h2>
           <div class="detail-meta">${metaValues.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>
