@@ -24,17 +24,17 @@ els.historyToggle.checked = settings.recordHistory;
 els.nativeHlsToggle.checked = settings.preferNativeHls;
 els.resumeToggle.checked = settings.resumePlayback;
 function tryNextImageSource(img) {
-  const original = img.dataset.originalSrc || '';
-  if (original && !img.dataset.originalTried) {
-    img.dataset.originalTried = '1';
-    img.src = original;
-    return true;
-  }
-
   const proxy = img.dataset.proxySrc || '';
   if (proxy && !img.dataset.proxyRetried) {
     img.dataset.proxyRetried = '1';
     img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
+    return true;
+  }
+
+  const original = img.dataset.originalSrc || '';
+  if (original && !img.dataset.originalTried) {
+    img.dataset.originalTried = '1';
+    img.src = original;
     return true;
   }
   return false;
@@ -97,11 +97,11 @@ function proxyImage(url, item = null) {
   try {
     const parsed = new URL(value);
     if (/(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
-      const params = new URLSearchParams({ rev: '7', url: value });
+      const params = new URLSearchParams({ rev: '11', url: value });
       const doubanId = doubanIdOf(item);
-      const title = String(item?.title || item?.name || item?.douban?.title || '').trim();
+      const kind = item?.mediaType === 'movie' ? 'movie' : item?.mediaType === 'tv' ? 'tv' : '';
       if (doubanId) params.set('id', doubanId);
-      if (title) params.set('title', title.slice(0, 100));
+      if (kind) params.set('kind', kind);
       return `/api/image?${params.toString()}`;
     }
   } catch {
