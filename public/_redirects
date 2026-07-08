@@ -4,4 +4,5 @@
 /history / 200
 /detail/* / 200
 /watch/* / 200
+/playlist/* / 200
 /category/* / 200

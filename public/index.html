@@ -7,7 +7,7 @@
   <meta name="description" content="Cactus TV" />
   <title>Cactus TV</title>
   <link rel="icon" href="/assets/cactus.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/styles.css?v=0.5.0" />
+  <link rel="stylesheet" href="/styles.css?v=0.6.0" />
 </head>
 <body>
   <header class="topbar" id="topbar">
@@ -35,6 +35,7 @@
     </nav>
 
     <div class="top-actions">
+      <button id="mediaProfileButton" class="profile-button" type="button" aria-label="切换媒体用户" title="切换媒体用户"><span id="mediaProfileInitial">M</span><small id="mediaProfileLabel">媒体用户</small></button>
       <button id="searchToggle" class="icon-button" type="button" aria-label="搜索" title="搜索">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.7" cy="10.7" r="6.8" fill="none" stroke="currentColor" stroke-width="2"/><path d="m15.8 15.8 4.5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
       </button>
@@ -152,7 +153,7 @@
       <button id="playerSwitchSource" class="file-button player-source-switch" type="button">切换备用线路</button>
       <span id="playbackStatus" class="playback-status"></span>
       <span id="resumeHint" class="muted"></span>
-      <span class="player-shortcuts">空格播放 · ←/→ 快退快进 · F 全屏</span>
+      <span class="player-shortcuts">空格播放 · ←/→ 快退快进 · F 全屏 · 遥控器方向键可操作</span>
     </div>
   </dialog>
 
@@ -165,37 +166,13 @@
       <label class="setting-row"><span><strong>播放失败自动换源</strong><small>保留当前进度并尝试其他线路或数据源</small></span><input id="failoverToggle" type="checkbox" checked /></label>
       <label class="setting-row"><span><strong>自动播放下一集</strong><small>播放结束后倒计时进入下一集</small></span><input id="autoNextToggle" type="checkbox" checked /></label>
 
-      <section class="media-settings">
+      <section class="media-profile-settings">
         <div class="media-settings-heading">
-          <div><h3>Emby / Jellyfin</h3><p>连接自己的媒体服务器。账号密码只用于换取访问令牌，密码不会保存。</p></div>
-          <button id="mediaConnectionReset" class="media-secondary-button" type="button">添加</button>
+          <div><h3>当前媒体用户</h3><p>连接和账号管理已移到管理后台。这里仅切换前台使用的 Jellyfin / Emby 用户。</p></div>
         </div>
-        <div id="mediaConnectionList" class="media-connection-list"></div>
-        <form id="mediaConnectionForm" class="media-connection-form hidden">
-          <input id="mediaConnectionId" type="hidden" />
-          <div class="media-form-grid">
-            <label>类型<select id="mediaKind"><option value="jellyfin">Jellyfin</option><option value="emby">Emby</option></select></label>
-            <label>显示名称<input id="mediaName" maxlength="80" placeholder="家庭媒体库" /></label>
-          </div>
-          <label>服务器地址<input id="mediaServerUrl" type="url" required placeholder="https://jellyfin.example.com" /></label>
-          <div class="media-auth-tabs" role="tablist">
-            <button class="media-auth-tab active" data-media-auth="password" type="button">账号密码</button>
-            <button class="media-auth-tab" data-media-auth="token" type="button">访问令牌</button>
-          </div>
-          <div id="mediaPasswordFields" class="media-form-grid">
-            <label>用户名<input id="mediaUsername" autocomplete="username" /></label>
-            <label>密码<input id="mediaPassword" type="password" autocomplete="current-password" /></label>
-          </div>
-          <div id="mediaTokenFields" class="media-form-grid hidden">
-            <label>访问令牌<input id="mediaToken" type="password" autocomplete="off" /></label>
-            <label>用户 ID<input id="mediaUserId" autocomplete="off" /></label>
-          </div>
-          <p class="media-form-note">Cloudflare Pages 只能连接公网可访问的 HTTPS 地址，不能连接 192.168.x.x、localhost 或纯 HTTP。</p>
-          <div class="media-form-actions">
-            <button id="mediaConnectButton" class="media-primary-button" type="submit">连接并保存</button>
-            <button id="mediaConnectionCancel" class="media-secondary-button" type="button">取消</button>
-          </div>
-        </form>
+        <label class="profile-select-row">媒体用户<select id="mediaProfileSelect"></select></label>
+        <div id="mediaProfileSummary" class="media-profile-summary"></div>
+        <a id="manageMediaLink" class="media-manage-link" href="/admin.html#media">前往管理后台连接或编辑</a>
       </section>
     </div>
   </dialog>
@@ -203,6 +180,6 @@
   <div id="toast" class="toast hidden" role="status"></div>
 
   <footer><span id="footerName">Cactus TV</span><span id="metadataCredit"></span></footer>
-  <script type="module" src="/js/app.js?v=0.5.0"></script>
+  <script type="module" src="/js/app.js?v=0.6.0"></script>
 </body>
 </html>
