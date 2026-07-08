@@ -2,6 +2,10 @@ import { requireDb } from './db';
 import { HttpError } from './http';
 import type { Env, Provider } from './types';
 
+const PROVIDER_TTL = 15_000;
+let enabledCache: { value: Provider[]; expires: number } | null = null;
+let allCache: { value: Provider[]; expires: number } | null = null;
+
 const PRIVATE_HOSTS = /^(localhost|127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$)/i;
 
 export function validateHttpsUrl(value: string): string {
@@ -55,18 +59,33 @@ function envProviders(env: Env): Provider[] {
   return parsed.map(normalizeProvider).filter(provider => provider.enabled);
 }
 
+export function invalidateProviderCache(): void {
+  enabledCache = null;
+  allCache = null;
+}
+
 export async function getProviders(env: Env, includeDisabled = false): Promise<Provider[]> {
+  const cache = includeDisabled ? allCache : enabledCache;
+  if (cache && cache.expires > Date.now()) return cache.value;
+
+  let list: Provider[] = [];
   if (env.DB) {
     try {
       const result = await env.DB.prepare(`SELECT id, name, base_url, enabled, priority, proxy_enabled, media_hosts, headers_json, created_at, updated_at
         FROM providers ${includeDisabled ? '' : 'WHERE enabled = 1'} ORDER BY priority DESC, name ASC`).all<any>();
-      if ((result.results || []).length) return result.results.map(row => normalizeProvider({
+      if ((result.results || []).length) list = result.results.map(row => normalizeProvider({
         ...row, baseUrl: row.base_url, proxyEnabled: row.proxy_enabled, mediaHosts: safeJson(row.media_hosts, []), requestHeaders: safeJson(row.headers_json, {})
       }));
     } catch (error) { console.warn('D1 providers unavailable, falling back to env', error); }
   }
-  const list = envProviders(env);
-  return includeDisabled ? list : list.filter(p => p.enabled);
+  if (!list.length) {
+    const envList = envProviders(env);
+    list = includeDisabled ? envList : envList.filter(provider => provider.enabled);
+  }
+  const entry = { value: list, expires: Date.now() + PROVIDER_TTL };
+  if (includeDisabled) allCache = entry;
+  else enabledCache = entry;
+  return list;
 }
 
 export async function findProvider(env: Env, id: string): Promise<Provider | undefined> {
@@ -111,4 +130,5 @@ export async function saveProvider(env: Env, provider: Provider): Promise<void> 
       headers_json=excluded.headers_json, updated_at=datetime('now')`)
     .bind(provider.id, provider.name, provider.baseUrl, provider.enabled ? 1 : 0, provider.priority,
       provider.proxyEnabled ? 1 : 0, JSON.stringify(provider.mediaHosts), JSON.stringify(provider.requestHeaders)).run();
+  invalidateProviderCache();
 }

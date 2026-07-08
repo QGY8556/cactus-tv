@@ -24,8 +24,8 @@ export function json(data: unknown, status = 200, extraHeaders: HeadersInit = {}
   });
 }
 
-export function ok(data: Record<string, unknown> = {}, status = 200): Response {
-  return json({ ok: true, ...data }, status);
+export function ok(data: Record<string, unknown> = {}, status = 200, extraHeaders: HeadersInit = {}): Response {
+  return json({ ok: true, ...data }, status, extraHeaders);
 }
 
 export function errorResponse(error: unknown, requestId?: string): Response {
