@@ -10,8 +10,8 @@ const DOUBAN_IMAGE_HOSTS = /(^|\.)doubanio\.com$/i;
 const NUMERIC_ID = /^\d{5,12}$/;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_METADATA_BYTES = 1024 * 1024;
-const CACHE_REVISION = '11';
-const POSTER_LOOKUP_REVISION = '2';
+const CACHE_REVISION = '12';
+const POSTER_LOOKUP_REVISION = '3';
 const IMAGE_ACCEPT = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
 const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36';
@@ -127,8 +127,8 @@ function imageCandidates(source: URL): URL[] {
   if (/\.webp$/i.test(clean.pathname)) paths.add(clean.pathname.replace(/\.webp$/i, '.jpg'));
   if (/\.jpe?g$/i.test(clean.pathname)) paths.add(clean.pathname.replace(/\.jpe?g$/i, '.webp'));
 
-  for (const hostname of IMAGE_HOST_ALTERNATES) {
-    for (const path of paths) {
+  for (const path of paths) {
+    for (const hostname of IMAGE_HOST_ALTERNATES) {
       const candidate = new URL(clean.toString());
       candidate.hostname = hostname;
       candidate.pathname = path;
@@ -138,7 +138,7 @@ function imageCandidates(source: URL): URL[] {
     }
   }
 
-  return output.slice(0, 30);
+  return output.slice(0, 14);
 }
 
 async function fetchImageOnce(url: URL, headers: HeadersInit, timeoutMs: number): Promise<{ response: Response | null; body: ArrayBuffer | null }> {
@@ -165,14 +165,16 @@ async function fetchImageOnce(url: URL, headers: HeadersInit, timeoutMs: number)
   }
 }
 
-async function fetchVerifiedImage(url: URL, timeoutMs = 5_000): Promise<ImageResult | null> {
+async function fetchVerifiedImage(url: URL, deadline: number): Promise<ImageResult | null> {
   const headerAttempts: HeadersInit[] = [
     DOUBAN_IMAGE_HEADERS,
     { Accept: IMAGE_ACCEPT, 'User-Agent': MOBILE_USER_AGENT },
   ];
 
   for (const headers of headerAttempts) {
-    const fetched = await fetchImageOnce(url, headers, timeoutMs);
+    const remaining = deadline - Date.now();
+    if (remaining <= 150) return null;
+    const fetched = await fetchImageOnce(url, headers, Math.min(2_500, remaining));
     if (!fetched.response || !fetched.body) continue;
     if (fetched.body.byteLength < 64 || fetched.body.byteLength > MAX_IMAGE_BYTES) continue;
 
@@ -184,13 +186,15 @@ async function fetchVerifiedImage(url: URL, timeoutMs = 5_000): Promise<ImageRes
 }
 
 async function firstVerifiedImage(candidates: URL[]): Promise<ImageResult | null> {
-  if (!candidates.length) return null;
+  const shortlist = candidates.slice(0, 14);
+  if (!shortlist.length) return null;
+  const deadline = Date.now() + 8_500;
 
-  const first = await fetchVerifiedImage(candidates[0]);
+  const first = await fetchVerifiedImage(shortlist[0], deadline);
   if (first) return first;
 
-  for (let index = 1; index < candidates.length; index += 4) {
-    const results = await Promise.all(candidates.slice(index, index + 4).map(candidate => fetchVerifiedImage(candidate, 4_500)));
+  for (let index = 1; index < shortlist.length && Date.now() < deadline - 150; index += 4) {
+    const results = await Promise.all(shortlist.slice(index, index + 4).map(candidate => fetchVerifiedImage(candidate, deadline)));
     const valid = results.find((value): value is ImageResult => Boolean(value));
     if (valid) return valid;
   }
@@ -300,8 +304,8 @@ function posterFromHtml(html: string): URL | null {
   return null;
 }
 
-async function lookupPosterEndpoint(url: URL, accept: string, referer: string): Promise<URL | null> {
-  const metadata = await fetchMetadata(url, accept, referer);
+async function lookupPosterEndpoint(url: URL, accept: string, referer: string, timeoutMs = 6_000): Promise<URL | null> {
+  const metadata = await fetchMetadata(url, accept, referer, timeoutMs);
   if (!metadata) return null;
 
   if (/json/i.test(metadata.contentType) || /^[\s\n\r]*[\[{]/.test(metadata.text)) {
@@ -341,9 +345,12 @@ async function currentDoubanPoster(
   }
 
   const kinds = kind ? [kind, kind === 'movie' ? 'tv' : 'movie'] : ['tv', 'movie'];
+  const deadline = Date.now() + 5_000;
   let poster: URL | null = null;
 
   for (const candidateKind of kinds) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 300) break;
     const endpoint = new URL(`https://m.douban.com/rexxar/api/v2/${candidateKind}/${doubanId}`);
     endpoint.searchParams.set('ck', '');
     endpoint.searchParams.set('for_mobile', '1');
@@ -351,16 +358,21 @@ async function currentDoubanPoster(
       endpoint,
       'application/json, text/plain, */*',
       `https://m.douban.com/movie/subject/${doubanId}/`,
+      Math.min(2_500, remaining),
     );
     if (poster) break;
   }
 
   if (!poster) {
-    poster = await lookupPosterEndpoint(
-      new URL(`https://movie.douban.com/subject/${doubanId}/`),
-      'text/html,application/xhtml+xml',
-      'https://movie.douban.com/',
-    );
+    const remaining = deadline - Date.now();
+    if (remaining > 300) {
+      poster = await lookupPosterEndpoint(
+        new URL(`https://movie.douban.com/subject/${doubanId}/`),
+        'text/html,application/xhtml+xml',
+        'https://movie.douban.com/',
+        Math.min(2_500, remaining),
+      );
+    }
   }
 
   const lookupResponse = new Response(poster?.toString() || '', {
