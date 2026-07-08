@@ -4,25 +4,12 @@
 
 Cactus TV 是一个部署在 Cloudflare Pages 上的私人影视检索与播放前端。它提供首页推荐、聚合搜索、片源切换、HLS 播放、观看记录、字幕和管理后台，但**项目本身不内置、不提供、也不推荐任何影视数据源**。
 
+TG频道 https://t.me/CactusFreeTv
+
 前台地址：`/`  
 管理后台：`/admin.html`
 
 > Cactus TV 的定位是播放器与片源管理界面，不是影视内容服务。部署完成后，需要由使用者自行配置合法、可用且已获授权的数据接口。
-
-
-## 从 v0.3.x 升级到 v0.4.0
-
-已经通过 GitHub 连接 Cloudflare Pages 的项目，升级时只需要把 v0.4.0 的仓库文件提交到原 GitHub 仓库。Cloudflare 会按现有设置自动重新部署。
-
-本次升级：
-
-- 不新增 D1 表，也不需要再次执行 SQL
-- 不新增 Binding、环境变量或 Secret
-- 不需要进入 Cloudflare 控制台修改构建设置
-- `public/_redirects` 会随 GitHub 提交自动部署，用于详情页和播放页直达路由
-- 原有数据源、后台设置、字幕、收藏和观看历史均可继续使用
-
-建议直接覆盖同名文件并提交，不要只上传 `public` 文件夹，因为 v0.4.0 同时修改了 `functions/api/search.ts`。
 
 ## 功能
 
@@ -161,14 +148,10 @@ README.md
 
 出现双层目录时，把内层项目文件全部移动到仓库根目录。
 
-### 三、上传到 GitHub
+### 三、 GitHub
 
-1. 在 GitHub 新建仓库，例如 `cactus-tv`。
-2. 私人使用建议选择 `Private`。
-3. 不需要让 GitHub 额外生成 README、License 或 `.gitignore`，项目已经包含这些文件。
-4. 打开空仓库，选择上传现有文件。
-5. 上传项目文件夹内部的全部内容。
-6. 提交后确认仓库首页能直接看到 `functions`、`migrations`、`public` 和 `package.json`。
+在 GitHub fork本项目即可
+
 
 ### 四、创建 Cloudflare Pages 项目
 
