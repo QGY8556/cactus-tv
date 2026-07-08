@@ -125,7 +125,9 @@ function renderHero(item) {
 
 function cardHtml(item, index, context = 'results') {
   const name = titleOf(item);
-  const visual = safeImage(item.backdrop || item.tmdb?.backdrop || item.pic || item.poster);
+  const landscapeVisual = safeImage(item.backdrop || item.tmdb?.backdrop || item.pic || item.poster);
+  const portraitVisual = safeImage(item.pic || item.poster || item.tmdb?.poster || item.backdrop || item.tmdb?.backdrop);
+  const visual = landscapeVisual || portraitVisual;
   const key = keyOf(item);
   const rating = Number(item.tmdb?.rating || item.rating || item.douban?.rating || 0);
   const favorite = context !== 'home' && store.isFavorite(key);
@@ -133,8 +135,12 @@ function cardHtml(item, index, context = 'results') {
   const primaryMeta = rating ? `★ ${rating.toFixed(1)}` : item.sourceCount > 1 ? `${item.sourceCount} 个片源` : '';
   const fallback = name.trim().slice(0, 1).toUpperCase() || 'C';
 
+  const image = visual
+    ? `<picture>${portraitVisual && portraitVisual !== landscapeVisual ? `<source media="(max-width: 1024px)" srcset="${escapeHtml(portraitVisual)}">` : ''}<img loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-fallback="${escapeHtml(fallback)}" src="${escapeHtml(visual)}" alt="${escapeHtml(name)}"></picture>`
+    : `<div class="poster-fallback">${escapeHtml(fallback)}</div>`;
+
   return `<article class="media-card" tabindex="0" role="button" aria-label="查看 ${escapeHtml(name)}" data-index="${index}" data-context="${context}">
-    <div class="poster">${visual ? `<img loading="lazy" referrerpolicy="no-referrer" data-fallback="${escapeHtml(fallback)}" src="${escapeHtml(visual)}" alt="${escapeHtml(name)}">` : `<div class="poster-fallback">${escapeHtml(fallback)}</div>`}
+    <div class="poster">${image}
       ${item.remarks ? `<span class="badge">${escapeHtml(item.remarks)}</span>` : rating ? `<span class="rating">★ ${rating.toFixed(1)}</span>` : ''}
       ${context !== 'home' ? `<button type="button" class="favorite-button ${favorite ? 'active' : ''}" data-favorite="${escapeHtml(key)}" aria-label="${favorite ? '取消收藏' : '收藏'}">${favorite ? '♥' : '+'}</button>` : ''}
       <div class="card-overlay"><strong>${escapeHtml(name)}</strong><div class="card-meta">${primaryMeta ? `<span class="match">${escapeHtml(primaryMeta)}</span>` : ''}${item.year ? `<span>${escapeHtml(item.year)}</span>` : ''}${type ? `<span>${escapeHtml(type)}</span>` : ''}</div></div>
@@ -146,9 +152,10 @@ function bindCards(container, items, context) {
   const activateCard = async (card, event) => {
     const item = items[Number(card.dataset.index)];
     if (!item) return;
-    if (event?.target?.closest?.('[data-favorite]')) {
+    const favoriteButton = event?.target?.closest?.('[data-favorite]');
+    if (favoriteButton) {
       event.stopPropagation();
-      toggleFavorite(item, event.target.closest('[data-favorite]'));
+      toggleFavorite(item, favoriteButton);
       return;
     }
     if (context === 'home') {
@@ -160,20 +167,28 @@ function bindCards(container, items, context) {
     }
   };
 
-  container.querySelectorAll('.media-card').forEach(card => {
-    card.addEventListener('click', event => activateCard(card, event));
-    card.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        activateCard(card, event);
-      }
-    });
+  container.addEventListener('click', event => {
+    const card = event.target.closest?.('.media-card');
+    if (card && container.contains(card)) activateCard(card, event);
   });
-  container.querySelectorAll('img').forEach(img => img.addEventListener('error', () => {
-    img.replaceWith(Object.assign(document.createElement('div'), { className: 'poster-fallback', textContent: img.dataset.fallback || 'C' }));
-  }, { once: true }));
+  container.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const card = event.target.closest?.('.media-card');
+    if (!card || !container.contains(card)) return;
+    event.preventDefault();
+    activateCard(card, event);
+  });
+  container.addEventListener('error', event => {
+    const img = event.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    const picture = img.closest('picture');
+    const fallback = Object.assign(document.createElement('div'), {
+      className: 'poster-fallback',
+      textContent: img.dataset.fallback || 'C',
+    });
+    (picture || img).replaceWith(fallback);
+  }, true);
 }
-
 function render(items, title, kicker) {
   const list = items || [];
   setCompactView(true);
@@ -407,7 +422,14 @@ els.playerDialog.addEventListener('close', () => {
 window.addEventListener('keydown', event => {
   if (event.key === 'Escape' && document.body.classList.contains('search-open')) closeSearch();
 });
-window.addEventListener('scroll', () => els.topbar.classList.toggle('scrolled', window.scrollY > 28), { passive: true });
+let scrollFrame = 0;
+window.addEventListener('scroll', () => {
+  if (scrollFrame) return;
+  scrollFrame = requestAnimationFrame(() => {
+    els.topbar.classList.toggle('scrolled', window.scrollY > 28);
+    scrollFrame = 0;
+  });
+}, { passive: true });
 window.addEventListener('unhandledrejection', event => {
   console.error(event.reason);
   toast(event.reason?.message || '页面发生未处理错误', 'error');
