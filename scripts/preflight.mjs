@@ -3,9 +3,9 @@ import { constants } from 'node:fs';
 
 const required = [
   'public/index.html', 'public/admin.html', 'public/styles.css', 'public/_headers', 'public/_redirects',
-  'public/js/app.js', 'public/js/admin.js', 'public/js/api.js', 'public/js/player.js', 'public/js/player-ui.js',
-  'public/vendor/hls.min.js', 'functions/_middleware.ts', 'functions/_shared/auth.ts',
-  'functions/api/health.ts', 'functions/api/admin/providers.ts',
+  'public/js/app.js', 'public/js/app-legacy.js', 'public/js/admin.js', 'public/js/api.js', 'public/js/player.js', 'public/js/player-ui.js',
+  'public/vendor/hls.min.js', 'public/vendor/dash.all.min.js', 'functions/_middleware.ts', 'functions/_shared/auth.ts',
+  'functions/api/health.ts', 'functions/api/subtitle.ts', 'functions/api/admin/providers.ts',
   'migrations/0001_init.sql', 'DEPLOY.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
 ];
 
@@ -26,6 +26,8 @@ for (const forbidden of [
 try {
   const vendor = await stat('public/vendor/hls.min.js');
   if (vendor.size < 200_000) failures.push('内置 hls.js 文件异常或不完整');
+  const dashVendor = await stat('public/vendor/dash.all.min.js');
+  if (dashVendor.size < 500_000) failures.push('内置 dash.js 文件异常或不完整');
 } catch {}
 
 try {
