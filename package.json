@@ -1,6 +1,6 @@
 {
   "name": "cactus-tv",
-  "version": "0.6.0",
+  "version": "0.6.3",
   "private": true,
   "description": "Cactus TV for Cloudflare Pages, Pages Functions and D1.",
   "scripts": {
