@@ -1,6 +1,6 @@
-import { api } from './api.js?v=1.2.3';
-import { store } from './storage.js?v=1.2.3';
-import { buildPersonalizedHome } from './recommend.js?v=1.2.3';
+import { api } from './api.js?v=1.2.7';
+import { store } from './storage.js?v=1.2.7';
+import { buildPersonalizedHome } from './recommend.js?v=1.2.7';
 
 const $ = selector => document.querySelector(selector);
 const els = {
@@ -115,8 +115,8 @@ async function ensurePlayerModules() {
   if (playerApi && playerUI) return playerApi;
   if (!playerModulesPromise) {
     playerModulesPromise = Promise.all([
-      import('./player.js?v=1.2.3'),
-      import('./player-ui.js?v=1.2.3'),
+      import('./player.js?v=1.2.7'),
+      import('./player-ui.js?v=1.2.7'),
     ]).then(([apiModule, uiModule]) => {
       playerApi = apiModule;
       playerUI = uiModule.createPlayerUI({
@@ -864,31 +864,160 @@ function candidatesForDetail(detail, target, preferred = {}) {
   });
 }
 
+function mergeDetailSources(...groups) {
+  const map = new Map();
+  for (const source of groups.flatMap(group => Array.isArray(group) ? group : group ? [group] : [])) {
+    const provider = String(source?.provider || '').trim();
+    const id = String(source?.id || '').trim();
+    if (!provider || !id) continue;
+    const key = `${provider}:${id}`;
+    if (!map.has(key)) map.set(key, {
+      ...source,
+      provider,
+      id,
+      providerName: source?.providerName || source?.name || provider,
+    });
+  }
+  return [...map.values()];
+}
+
+function detailMatchScore(target, candidate) {
+  const targetTitle = normalizeTitle(rawTitleOf(target));
+  const candidateTitle = normalizeTitle(rawTitleOf(candidate));
+  if (!targetTitle || !candidateTitle) return -Infinity;
+  let score = targetTitle === candidateTitle ? 120 : (targetTitle.includes(candidateTitle) || candidateTitle.includes(targetTitle) ? 45 : -80);
+  const targetYear = String(target?.year || '').match(/(?:19|20)\d{2}/)?.[0] || '';
+  const candidateYear = String(candidate?.year || '').match(/(?:19|20)\d{2}/)?.[0] || '';
+  if (targetYear && candidateYear) score += targetYear === candidateYear ? 24 : -16;
+  const targetKind = broadKind(target);
+  const candidateKind = broadKind(candidate);
+  if (targetKind !== 'other' && candidateKind !== 'other') score += targetKind === candidateKind ? 14 : -8;
+  const targetTmdb = String(target?.tmdb?.id || target?.tmdbId || '');
+  const candidateTmdb = String(candidate?.tmdb?.id || candidate?.tmdbId || '');
+  if (targetTmdb && candidateTmdb) score += targetTmdb === candidateTmdb ? 80 : -100;
+  const targetDouban = String(target?.douban?.id || target?.doubanId || '');
+  const candidateDouban = String(candidate?.douban?.id || candidate?.doubanId || '');
+  if (targetDouban && candidateDouban) score += targetDouban === candidateDouban ? 80 : -100;
+  return score;
+}
+
+function bestDetailSearchMatch(target, items = []) {
+  return [...items]
+    .map(item => ({ item, score: detailMatchScore(target, item) }))
+    .sort((a, b) => b.score - a.score)
+    .find(entry => entry.score >= 70)?.item || null;
+}
+
+async function resolveAvailableDetail(item, sourceOverride = null) {
+  const tried = new Set();
+  let lastError = null;
+  let matchedItem = item;
+  const health = await api.health().catch(() => null);
+  const activeProviders = new Set((health?.providers || []).map(provider => String(provider?.id || '')));
+
+  const tryCandidates = async candidates => {
+    const ordered = mergeDetailSources(candidates).sort((a, b) => {
+      const aActive = activeProviders.size ? activeProviders.has(a.provider) : true;
+      const bActive = activeProviders.size ? activeProviders.has(b.provider) : true;
+      return Number(bActive) - Number(aActive);
+    });
+    for (const source of ordered) {
+      const key = `${source.provider}:${source.id}`;
+      if (tried.has(key)) continue;
+      tried.add(key);
+      if (activeProviders.size && !activeProviders.has(source.provider)) continue;
+      try {
+        const payload = await api.detail(source.provider, source.id);
+        if (payload?.item) return { detail: payload.item, source, matchedItem };
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError = error;
+      }
+    }
+    return null;
+  };
+
+  let resolved = await tryCandidates(mergeDetailSources(sourceOverride, item, item?.sources));
+  if (resolved) return resolved;
+
+  const query = rawTitleOf(item);
+  if (query && !isPlaceholderTitle(query)) {
+    try {
+      const payload = await api.search(query);
+      const match = bestDetailSearchMatch(item, payload?.items || []);
+      if (match) {
+        matchedItem = { ...match, ...canonicalItem(item, match), sources: mergeDetailSources(item?.sources, match?.sources, match) };
+        resolved = await tryCandidates(mergeDetailSources(match, match?.sources));
+        if (resolved) return { ...resolved, matchedItem };
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      lastError ||= error;
+    }
+  }
+
+  throw lastError || new Error('当前记录对应的数据源已经失效，且没有找到可用的同名片源');
+}
+
 async function openDetail(item, sourceOverride = null, options = {}) {
   const sequence = ++detailSequence;
-  const source = sourceOverride || { provider: item.provider, id: item.id, providerName: item.providerName };
-  if (!source.provider || !source.id) {
+  const initialSources = mergeDetailSources(sourceOverride, item, item?.sources);
+  if (!initialSources.length && (!rawTitleOf(item) || isPlaceholderTitle(rawTitleOf(item)))) {
     await search(titleOf(item));
     return;
   }
-  if (options.push !== false) navigate(detailPath(source.provider, source.id), { apply: false, state: { overlay: 'detail', from: location.pathname + location.search } });
   els.detailContent.innerHTML = '<div class="empty-state"><div class="empty-icon">C</div><p>正在加载详情…</p></div>';
   if (!els.detailDialog.open) els.detailDialog.showModal();
 
   try {
-    const payload = await api.detail(source.provider, source.id);
+    const resolved = await resolveAvailableDetail(item, sourceOverride);
     if (sequence !== detailSequence) return null;
-    const detail = payload.item;
+    const { detail, source, matchedItem } = resolved;
     const canonicalKey = item.key || detail.key;
     detail.canonicalKey = canonicalKey;
-    const mergedItem = { ...canonicalItem(detail, item), provider: detail.provider, id: detail.id, providerName: detail.providerName, key: canonicalKey };
+    const mergedSources = mergeDetailSources(item?.sources, matchedItem?.sources, source, {
+      provider: detail.provider,
+      providerName: detail.providerName,
+      id: detail.id,
+    });
+    const mergedItem = {
+      ...canonicalItem(detail, matchedItem, item),
+      provider: detail.provider,
+      id: detail.id,
+      providerName: detail.providerName,
+      key: canonicalKey,
+      ...(mergedSources.length ? { sources: mergedSources } : {}),
+    };
+
+    const resolvedPath = detailPath(detail.provider, detail.id);
+    if (options.push !== false) {
+      navigate(resolvedPath, { apply: false, state: { overlay: 'detail', from: location.pathname + location.search } });
+    } else if (location.pathname.startsWith('/detail/') && location.pathname !== resolvedPath) {
+      history.replaceState({ ...(history.state || {}), cactus: true }, '', resolvedPath);
+    }
+
+    const oldHistory = store.progress(canonicalKey);
+    if (oldHistory && (oldHistory.provider !== detail.provider || String(oldHistory.id) !== String(detail.id)
+      || historyNeedsMetadata(oldHistory))) {
+      store.repairHistory({
+        ...oldHistory,
+        ...mergedItem,
+        key: canonicalKey,
+        provider: detail.provider,
+        providerName: detail.providerName,
+        id: detail.id,
+        watchedAt: oldHistory.watchedAt,
+      });
+      idle(() => store.flush().catch(() => {}), 500);
+    }
+
     currentDetailContext = { item: mergedItem, detail, source };
     renderDetail(mergedItem, detail);
     return detail;
   } catch (error) {
     if (sequence !== detailSequence) return null;
-    els.detailContent.innerHTML = `<div class="empty-state"><div class="empty-icon">!</div><h3>详情加载失败</h3><p>${escapeHtml(error.message)}</p><button class="primary-button" id="retryDetail">重试</button></div>`;
-    $('#retryDetail')?.addEventListener('click', () => openDetail(item, source, { push: false }));
+    els.detailContent.innerHTML = `<div class="empty-state"><div class="empty-icon">!</div><h3>详情加载失败</h3><p>${escapeHtml(error.message)}</p><button class="primary-button" id="retryDetail">重新查找可用片源</button></div>`;
+    $('#retryDetail')?.addEventListener('click', () => openDetail(item, null, { push: false }));
     return null;
   }
 }

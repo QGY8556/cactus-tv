@@ -218,6 +218,10 @@ function cleanupSession(session, clearSource = true) {
   session.listeners.forEach(([target, name, listener, options]) => target.removeEventListener(name, listener, options));
   session.listeners.length = 0;
   releaseSessionWakeLock(session);
+  if (session.videoFrameCallbackId && typeof session.video?.cancelVideoFrameCallback === 'function') {
+    try { session.video.cancelVideoFrameCallback(session.videoFrameCallbackId); } catch {}
+    session.videoFrameCallbackId = 0;
+  }
   try { session.hls?.destroy(); } catch {}
   try { session.dash?.reset(); } catch {}
   session.hls = null;
@@ -241,7 +245,12 @@ function createSession(video, url, resumeAt) {
     stallSince: 0, stallRecoveries: 0, stallCount: 0, lastProgressAt: performance.now(),
     lastCurrentTime: 0, startedAt: performance.now(), firstFrameAt: 0, bandwidth: 0,
     lastEmergencyDownshiftAt: 0, emergencyDownshifts: 0, bufferTarget: 0, cleanStreamRemoved: 0,
-    wakeLock: null, offlineSince: 0, lastNetworkRecoveryAt: 0, bufferRampStage: 0,
+    wakeLock: null, offlineSince: 0, lastNetworkRecoveryAt: 0, bufferRampStage: 0, bufferPressureCount: 0,
+    bandwidthSamples: [], peakBandwidth: 0, lastAggressivePromotionAt: 0, qualityRecoveryHoldUntil: 0,
+    lastVideoFrameAt: performance.now(), lastVideoFrameMediaTime: 0, videoFrameSerial: 0,
+    videoFrameCallbackId: 0, lastDecodedFrames: 0, lastVisualCheckMediaTime: 0,
+    visualFreezeSince: 0, visualRecoveries: 0, lastVisualRecoveryAt: 0,
+    seekGeneration: 0, seekStartedAt: 0, seekFrameSerial: 0, seekWasPlaying: false,
   };
   activeSession = session;
   return session;
@@ -325,12 +334,131 @@ function emergencyDownshift(session) {
   const next = Math.max(0, current - 1);
   if (next >= current) return false;
   session.lastEmergencyDownshiftAt = now;
+  session.qualityRecoveryHoldUntil = Math.max(Number(session.qualityRecoveryHoldUntil || 0), now + 12_000);
   session.emergencyDownshifts += 1;
   try {
     hls.nextAutoLevel = next;
     emit(session.video, 'qualityRecovery', { from: current, to: next, reason: 'buffer-starvation' });
     return true;
   } catch { return false; }
+}
+
+function presentedFrameCount(video) {
+  try {
+    const quality = video.getVideoPlaybackQuality?.();
+    const total = Number(quality?.totalVideoFrames || video.webkitDecodedFrameCount || 0);
+    return Number.isFinite(total) ? total : 0;
+  } catch { return 0; }
+}
+
+function markPresentedFrame(session, mediaTime = session.video.currentTime) {
+  if (!session || session.cleaned) return;
+  session.lastVideoFrameAt = performance.now();
+  session.lastVideoFrameMediaTime = Number(mediaTime || 0);
+  session.videoFrameSerial += 1;
+  session.visualFreezeSince = 0;
+  if (session.visualRecoveries && performance.now() - Number(session.lastVisualRecoveryAt || 0) > 8000) {
+    session.visualRecoveries = 0;
+  }
+}
+
+function bindVideoFrameMonitor(session) {
+  const { video } = session;
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    const requestNext = () => {
+      if (session.cleaned || session.generation !== playbackGeneration) return;
+      session.videoFrameCallbackId = video.requestVideoFrameCallback((_now, metadata) => {
+        session.videoFrameCallbackId = 0;
+        markPresentedFrame(session, metadata?.mediaTime);
+        requestNext();
+      });
+    };
+    requestNext();
+  } else {
+    session.lastDecodedFrames = presentedFrameCount(video);
+    addTimer(session, () => {
+      const total = presentedFrameCount(video);
+      if (total > Number(session.lastDecodedFrames || 0)) markPresentedFrame(session, video.currentTime);
+      session.lastDecodedFrames = total;
+    }, 500, true);
+  }
+}
+
+function recoverVisualFreeze(session, reason = 'video-frame-stalled', { resume = !session.video.paused } = {}) {
+  if (!session || !session.verified || session.cleaned || session.failed || session.video.seeking || document.hidden || !navigator.onLine) return false;
+  const now = performance.now();
+  if (now - Number(session.lastVisualRecoveryAt || 0) < 1800) return false;
+
+  const { video } = session;
+  const position = Math.max(0, Number(video.currentTime || 0));
+  const frameSerial = Number(session.videoFrameSerial || 0);
+  const attempt = Number(session.visualRecoveries || 0) + 1;
+  session.visualRecoveries = attempt;
+  session.lastVisualRecoveryAt = now;
+  session.visualFreezeSince = now;
+  session.qualityRecoveryHoldUntil = Math.max(Number(session.qualityRecoveryHoldUntil || 0), now + 20_000);
+  emit(video, 'state', { state: 'recovering', attempt, reason });
+  emit(video, 'visualRecovery', { attempt, reason, position });
+
+  try {
+    if (session.hls) {
+      emergencyDownshift(session);
+      if (attempt === 1) {
+        // Restart fragment loading around the current clock without changing
+        // currentTime again. A second synthetic seek here can race the user's
+        // seek and create another frozen-frame loop.
+        try { session.hls.stopLoad(); } catch {}
+        try { session.hls.startLoad(Math.max(0, position - 0.2)); } catch {}
+      } else {
+        try { session.hls.stopLoad(); } catch {}
+        try {
+          if (attempt >= 3) session.hls.swapAudioCodec();
+          session.hls.recoverMediaError();
+        } catch {}
+      }
+    } else if (session.dash) {
+      try { session.dash.seek(Math.max(0, position - 0.04)); } catch {}
+    } else {
+      try { video.currentTime = Math.max(0, position - 0.04); } catch {}
+    }
+    if (resume) safePlay(video).catch(() => {});
+  } catch {}
+
+  addTimer(session, () => {
+    if (session.cleaned || session.failed || video.seeking) return;
+    const frameRecovered = Number(session.videoFrameSerial || 0) > frameSerial
+      && Math.abs(Number(session.lastVideoFrameMediaTime || video.currentTime) - Number(video.currentTime || 0)) < 2.5;
+    if (frameRecovered) {
+      session.visualFreezeSince = 0;
+      emit(video, 'state', { state: video.paused ? 'ready' : 'playing', reason: 'video-frame-recovered' });
+      return;
+    }
+    if (attempt < 3) recoverVisualFreeze(session, reason, { resume });
+    else failSession(session, new Error('画面解码持续冻结，正在切换备用线路'));
+  }, attempt === 1 ? 1600 : 2200);
+  return true;
+}
+
+function scheduleSeekFrameVerification(session) {
+  const { video } = session;
+  const generation = Number(session.seekGeneration || 0);
+  const target = Number(video.currentTime || 0);
+  const frameSerial = Number(session.seekFrameSerial || session.videoFrameSerial || 0);
+  const resume = Boolean(session.seekWasPlaying);
+
+  if (session.hls) {
+    try { session.hls.startLoad(Math.max(0, target - 0.15)); } catch {}
+  } else if (session.dash) {
+    try { session.dash.seek(target); } catch {}
+  }
+
+  addTimer(session, () => {
+    if (session.cleaned || session.failed || video.seeking || generation !== session.seekGeneration) return;
+    const frameAdvanced = Number(session.videoFrameSerial || 0) > frameSerial;
+    const frameNearTarget = Math.abs(Number(session.lastVideoFrameMediaTime || -9999) - Number(video.currentTime || target)) < 2.5;
+    if (frameAdvanced && frameNearTarget) return;
+    recoverVisualFreeze(session, 'seek-video-frame-timeout', { resume });
+  }, 1400);
 }
 
 function recoverStall(session) {
@@ -389,9 +517,11 @@ function bindStallMonitor(session) {
   listen(session, video, 'playing', markProgress);
   listen(session, video, 'seeked', () => {
     session.lastCurrentTime = Number(video.currentTime || 0);
+    session.lastVisualCheckMediaTime = Number(video.currentTime || 0);
     session.lastProgressAt = performance.now();
     session.stallSince = 0;
     session.stallRecoveries = 0;
+    if (session.verified) scheduleSeekFrameVerification(session);
   });
   listen(session, video, 'waiting', markStall);
   listen(session, video, 'stalled', markStall);
@@ -412,6 +542,33 @@ function bindStallMonitor(session) {
     if (stalledFor > 5000 && session.stallRecoveries < 3) recoverStall(session);
     if (stalledFor > 20000) failSession(session, new Error('播放持续卡住，正在切换备用线路'));
   }, 3000, true);
+
+  // currentTime follows the audio clock. It may keep advancing even when the
+  // video decoder is frozen on one frame, so the ordinary stall monitor cannot
+  // detect this failure. Watch actual presented video frames separately.
+  addTimer(session, () => {
+    if (!session.verified || video.paused || video.ended || video.seeking || session.failed || document.hidden || !navigator.onLine) {
+      session.lastVisualCheckMediaTime = Number(video.currentTime || 0);
+      session.visualFreezeSince = 0;
+      return;
+    }
+    if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+    const now = performance.now();
+    const current = Number(video.currentTime || 0);
+    const mediaAdvanced = current > Number(session.lastVisualCheckMediaTime || 0) + 0.22;
+    const frameAge = now - Number(session.lastVideoFrameAt || now);
+    session.lastVisualCheckMediaTime = current;
+    if (!mediaAdvanced || frameAge < 1800) {
+      if (frameAge < 900) session.visualFreezeSince = 0;
+      return;
+    }
+    if (!session.visualFreezeSince) {
+      session.visualFreezeSince = now;
+      emit(video, 'state', { state: 'recovering', reason: 'video-frame-stalled' });
+      return;
+    }
+    if (now - session.visualFreezeSince >= 900) recoverVisualFreeze(session, 'video-frame-stalled');
+  }, 1000, true);
 }
 
 function verifySession(session) {
@@ -489,7 +646,15 @@ function bindMediaState(session) {
   listen(session, video, 'loadstart', () => state('loading'));
   listen(session, video, 'waiting', () => { if (!video.paused && !video.seeking && navigator.onLine && !document.hidden) state('buffering'); });
   listen(session, video, 'stalled', () => { if (!video.paused && navigator.onLine && !document.hidden) state('buffering'); });
-  listen(session, video, 'seeking', () => state('buffering'));
+  listen(session, video, 'seeking', () => {
+    session.seekGeneration += 1;
+    session.seekStartedAt = performance.now();
+    session.seekFrameSerial = Number(session.videoFrameSerial || 0);
+    session.seekWasPlaying = !video.paused;
+    session.visualFreezeSince = 0;
+    session.lastVisualCheckMediaTime = Number(video.currentTime || 0);
+    state('buffering');
+  });
   listen(session, video, 'playing', () => {
     session.started = true;
     requestSessionWakeLock(session);
@@ -530,6 +695,7 @@ function bindMediaState(session) {
     }
   });
 
+  bindVideoFrameMonitor(session);
   bindStallMonitor(session);
 }
 
@@ -552,34 +718,33 @@ function deviceProfile() {
   const memory = Number(navigator.deviceMemory || 8);
   const cores = Number(navigator.hardwareConcurrency || 8);
   const slowNetwork = /(^|-)2g$|3g/i.test(connection.effectiveType || '')
-    || (downlink > 0 && downlink < 2)
-    || (Number(connection.rtt || 0) > 450);
+    || (downlink > 0 && downlink < 1.5)
+    || (Number(connection.rtt || 0) > 550);
   const lowMemory = memory <= 2;
   const lowCpu = cores <= 2;
   const constrained = Boolean(connection.saveData || /(^|-)2g$/i.test(connection.effectiveType || '') || (lowMemory && lowCpu));
   const mobile = matchMedia('(max-width: 900px)').matches || matchMedia('(pointer: coarse)').matches;
 
-  // Keep the deep buffer active from the first HLS load. Limiting the initial
-  // target to 45/60 seconds made hls.js stop requesting as soon as that small
-  // window filled, which sharply reduced sustained download throughput.
+  // Burst-throughput profile: keep a useful local reservoir without turning the
+  // player into a whole-movie downloader. The main change from v1.2.4 is that
+  // throughput and ABR remain aggressive while the buffer returns to practical
+  // private-cinema limits.
   const targetBuffer = constrained ? 90 : mobile ? 200 : 300;
-  const memorySafeBuffer = constrained ? 60 : mobile ? 100 : 150;
+  const memorySafeBuffer = constrained ? 72 : mobile ? 140 : 210;
   const maxBuffer = constrained ? 140 : mobile ? 300 : 450;
   const backBuffer = constrained ? 36 : mobile ? 100 : 160;
-  // Private-cinema profile: allow the player to keep a much larger byte
-  // reservoir while the time window remains bounded by targetBuffer/maxBuffer.
-  // maxBufferSize is a ceiling, not an eager allocation; memory-pressure events
-  // below shrink it automatically instead of letting the tab become unstable.
+
   const maxBufferBytes = constrained
     ? 192 * 1024 * 1024
     : mobile
-      ? (memory >= 8 ? 768 : memory >= 4 ? 512 : 384) * 1024 * 1024
-      : (memory >= 8 ? 1536 : 896) * 1024 * 1024;
+      ? (memory >= 8 ? 768 : memory >= 4 ? 640 : 448) * 1024 * 1024
+      : (memory >= 8 ? 1280 : 1024) * 1024 * 1024;
   const bufferByteFloor = constrained
     ? 96 * 1024 * 1024
     : mobile
-      ? (memory >= 8 ? 384 : 256) * 1024 * 1024
-      : (memory >= 8 ? 768 : 512) * 1024 * 1024;
+      ? (memory >= 8 ? 448 : memory >= 4 ? 384 : 256) * 1024 * 1024
+      : (memory >= 8 ? 768 : 640) * 1024 * 1024;
+
   return {
     constrained, mobile, slowNetwork, downlink, lowMemory, lowCpu, memory, cores,
     targetBuffer, memorySafeBuffer, maxBuffer, backBuffer, maxBufferBytes, bufferByteFloor,
@@ -603,6 +768,59 @@ function emitHlsTracks(session, Hls) {
   emit(session.video, 'subtitleTracks', { tracks: subtitles, current: Number(hls.subtitleTrack ?? -1) });
 }
 
+function percentile(values, ratio = 0.75) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * ratio)));
+  return Number(sorted[index] || 0);
+}
+
+function recordActiveThroughput(session, hls, data) {
+  const loaded = Number(data?.stats?.loaded || 0);
+  const loading = data?.stats?.loading || {};
+  const startedAt = Number(loading.first || loading.start || 0);
+  const endedAt = Number(loading.end || 0);
+  const durationMs = Math.max(1, endedAt - startedAt);
+  if (!loaded || !Number.isFinite(durationMs)) return;
+
+  const sample = Math.round((loaded * 8 * 1000) / durationMs);
+  if (!Number.isFinite(sample) || sample <= 0) return;
+  session.bandwidthSamples.push(sample);
+  if (session.bandwidthSamples.length > 12) session.bandwidthSamples.splice(0, session.bandwidthSamples.length - 12);
+  session.peakBandwidth = Math.max(Number(session.peakBandwidth || 0), sample);
+  session.bandwidth = session.bandwidth
+    ? Math.round((session.bandwidth * 0.25) + (sample * 0.75))
+    : sample;
+
+  // hls.js already downloads each fragment as quickly as the connection allows.
+  // This promotion only prevents one slow sample from pinning ABR to a low level.
+  if (!hls?.autoLevelEnabled || !Array.isArray(hls.levels) || hls.levels.length < 2) return;
+  if (session.stallSince || bufferAhead(session.video) < 12) return;
+  const now = performance.now();
+  if (now < Number(session.qualityRecoveryHoldUntil || 0)) return;
+  if (now - Number(session.lastAggressivePromotionAt || 0) < 1400) return;
+
+  const sustained = Math.max(sample, percentile(session.bandwidthSamples, 0.75));
+  const usable = sustained * 0.95;
+  let target = 0;
+  hls.levels.forEach((level, index) => {
+    const bitrate = Number(level?.maxBitrate || level?.bitrate || 0);
+    if (!bitrate || bitrate <= usable) target = index;
+  });
+  const current = Number.isInteger(hls.currentLevel) && hls.currentLevel >= 0
+    ? hls.currentLevel
+    : Number.isInteger(hls.nextLoadLevel) && hls.nextLoadLevel >= 0
+      ? hls.nextLoadLevel
+      : 0;
+  if (target > current) {
+    session.lastAggressivePromotionAt = now;
+    try {
+      hls.nextAutoLevel = target;
+      emit(session.video, 'qualityRecovery', { from: current, to: target, reason: 'throughput-promotion' });
+    } catch {}
+  }
+}
+
 async function playWithHls(session) {
   const Hls = await loadHls();
   if (session.cleaned || session.generation !== playbackGeneration) throw new DOMException('播放已取消', 'AbortError');
@@ -610,9 +828,18 @@ async function playWithHls(session) {
   const profile = deviceProfile();
   const { constrained, mobile, slowNetwork, downlink } = profile;
   const proxied = isSameOriginProxy(session.url);
-  const defaultEstimate = downlink
-    ? Math.max(900000, Math.min(12_000_000, downlink * 850000))
-    : mobile ? 2_800_000 : 4_500_000;
+  const deviceFloor = constrained
+    ? 3_000_000
+    : mobile
+      ? (profile.memory >= 8 ? 80_000_000 : profile.memory >= 4 ? 50_000_000 : 30_000_000)
+      : 120_000_000;
+  // Network Information API values are frequently rounded down on Chromium.
+  // A low reported value may never lower the private-cinema floor; it can only
+  // raise the estimate when the browser reports a genuinely faster link.
+  const reportedEstimate = downlink > 0 ? downlink * 1_250_000 : 0;
+  const defaultEstimate = constrained
+    ? Math.max(2_000_000, Math.min(8_000_000, reportedEstimate || deviceFloor))
+    : Math.min(mobile ? 180_000_000 : 280_000_000, Math.max(deviceFloor, reportedEstimate));
   session.bufferTarget = profile.targetBuffer;
   const hls = new Hls({
     enableWorker: true,
@@ -620,18 +847,18 @@ async function playWithHls(session) {
     capLevelToPlayerSize: true,
     capLevelOnFPSDrop: true,
     fpsDroppedMonitoringPeriod: 5000,
-    fpsDroppedMonitoringThreshold: 0.18,
+    fpsDroppedMonitoringThreshold: 0.28,
     startLevel: slowNetwork ? 0 : -1,
     startFragPrefetch: true,
     testBandwidth: true,
     abrEwmaDefaultEstimate: defaultEstimate,
-    abrEwmaFastVoD: 2,
-    abrEwmaSlowVoD: 7,
+    abrEwmaFastVoD: slowNetwork ? 2.0 : 0.75,
+    abrEwmaSlowVoD: slowNetwork ? 7 : 2.8,
     abrMaxWithRealBitrate: true,
-    abrBandWidthFactor: slowNetwork ? 0.72 : 0.88,
-    abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.76,
-    maxStarvationDelay: slowNetwork ? 2 : 3.5,
-    maxLoadingDelay: slowNetwork ? 2.5 : 5,
+    abrBandWidthFactor: slowNetwork ? 0.78 : 1.0,
+    abrBandWidthUpFactor: slowNetwork ? 0.65 : 0.98,
+    maxStarvationDelay: slowNetwork ? 2.5 : 8,
+    maxLoadingDelay: slowNetwork ? 4 : 15,
     // Keep the full local buffer target active immediately.
     backBufferLength: profile.backBuffer,
     maxBufferLength: profile.targetBuffer,
@@ -641,7 +868,7 @@ async function playWithHls(session) {
     maxFragLookUpTolerance: 0.2,
     progressive: true,
     enableSoftwareAES: true,
-    highBufferWatchdogPeriod: 3,
+    highBufferWatchdogPeriod: 2,
     nudgeOffset: 0.08,
     nudgeMaxRetry: 4,
     manifestLoadingTimeOut: 10000,
@@ -702,9 +929,7 @@ async function playWithHls(session) {
     });
     hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => emit(session.video, 'quality', { currentLevel: Number(data.level ?? -1), auto: hls.autoLevelEnabled }));
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
-      const loaded = Number(data?.stats?.loaded || 0);
-      const durationMs = Math.max(1, Number(data?.stats?.loading?.end || 0) - Number(data?.stats?.loading?.start || 0));
-      if (loaded) session.bandwidth = Math.round((loaded * 8 * 1000) / durationMs);
+      recordActiveThroughput(session, hls, data);
     });
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
       session.networkRecoveries = 0; session.mediaRecoveries = 0;
@@ -727,10 +952,17 @@ async function playWithHls(session) {
           emit(session.video, 'state', { state: 'buffering' });
         }
         if (/bufferFullError/i.test(detail)) {
-          const safeTarget = Math.min(session.bufferTarget || profile.targetBuffer, profile.memorySafeBuffer);
+          session.bufferPressureCount = Number(session.bufferPressureCount || 0) + 1;
+          const currentTarget = Number(hls.config.maxBufferLength || session.bufferTarget || profile.targetBuffer);
           const currentByteCeiling = Number(hls.config.maxBufferSize || profile.maxBufferBytes);
-          const safeByteCeiling = Math.max(profile.bufferByteFloor, Math.floor(currentByteCeiling * 0.72));
+          // Retreat gradually instead of collapsing from the turbo target to a
+          // tiny 100/150-second window on the first quota warning.
+          const targetFactor = session.bufferPressureCount === 1 ? 0.82 : 0.72;
+          const byteFactor = session.bufferPressureCount === 1 ? 0.84 : 0.74;
+          const safeTarget = Math.max(profile.memorySafeBuffer, Math.floor(currentTarget * targetFactor));
+          const safeByteCeiling = Math.max(profile.bufferByteFloor, Math.floor(currentByteCeiling * byteFactor));
           hls.config.maxBufferLength = safeTarget;
+          hls.config.maxMaxBufferLength = Math.max(safeTarget, Math.floor(Number(hls.config.maxMaxBufferLength || profile.maxBuffer) * targetFactor));
           hls.config.maxBufferSize = safeByteCeiling;
           session.bufferTarget = safeTarget;
           emit(session.video, 'bufferTarget', {
@@ -738,6 +970,7 @@ async function playWithHls(session) {
             target: safeTarget,
             maxBufferBytes: safeByteCeiling,
             reason: 'memory-pressure',
+            pressureCount: session.bufferPressureCount,
           });
         }
         return;
@@ -819,9 +1052,18 @@ async function playWithDash(session) {
   player.updateSettings({ streaming: {
     abr: {
       autoSwitchBitrate: { video: true, audio: true },
-      initialBitrate: { video: profile.slowNetwork ? 350 : -1 },
+      initialBitrate: {
+        video: profile.slowNetwork ? 500 : profile.mobile ? (profile.memory >= 8 ? 80000 : 50000) : 120000,
+      },
       limitBitrateByPortal: true,
       useDeadTimeLatency: true,
+      throughput: {
+        useResourceTimingApi: true,
+        useDeadTimeLatency: true,
+        bandwidthSafetyFactor: profile.slowNetwork ? 0.82 : 0.98,
+        sampleSettings: { vod: 2, live: 3, enableSampleSizeAdjustment: true, decreaseScale: 0.82, increaseScale: 1.5, maxMeasurementsToKeep: 12 },
+        ewma: { throughputSlowHalfLifeSeconds: 4, throughputFastHalfLifeSeconds: 1.5 },
+      },
     },
     buffer: {
       bufferTimeDefault: profile.targetBuffer,
