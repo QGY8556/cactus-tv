@@ -192,6 +192,24 @@ function clearSubtitleTracks(video) {
   subtitleUrls = [];
 }
 
+
+async function requestSessionWakeLock(session) {
+  if (!session || session.cleaned || session.wakeLock || !('wakeLock' in navigator) || document.hidden) return;
+  try {
+    session.wakeLock = await navigator.wakeLock.request('screen');
+    session.wakeLock.addEventListener?.('release', () => {
+      if (session) session.wakeLock = null;
+    }, { once: true });
+  } catch {}
+}
+
+function releaseSessionWakeLock(session) {
+  const lock = session?.wakeLock;
+  if (!lock) return;
+  session.wakeLock = null;
+  try { lock.release(); } catch {}
+}
+
 function cleanupSession(session, clearSource = true) {
   if (!session || session.cleaned) return;
   session.cleaned = true;
@@ -199,6 +217,7 @@ function cleanupSession(session, clearSource = true) {
   session.timers.clear();
   session.listeners.forEach(([target, name, listener, options]) => target.removeEventListener(name, listener, options));
   session.listeners.length = 0;
+  releaseSessionWakeLock(session);
   try { session.hls?.destroy(); } catch {}
   try { session.dash?.reset(); } catch {}
   session.hls = null;
@@ -222,6 +241,7 @@ function createSession(video, url, resumeAt) {
     stallSince: 0, stallRecoveries: 0, stallCount: 0, lastProgressAt: performance.now(),
     lastCurrentTime: 0, startedAt: performance.now(), firstFrameAt: 0, bandwidth: 0,
     lastEmergencyDownshiftAt: 0, emergencyDownshifts: 0, bufferTarget: 0, cleanStreamRemoved: 0,
+    wakeLock: null, offlineSince: 0, lastNetworkRecoveryAt: 0, bufferRampStage: 0,
   };
   activeSession = session;
   return session;
@@ -315,18 +335,23 @@ function emergencyDownshift(session) {
 
 function recoverStall(session) {
   const { video } = session;
+  if (document.hidden || !navigator.onLine || session.cleaned || session.failed) return;
   session.stallRecoveries += 1;
   emit(video, 'state', { state: 'reconnecting', attempt: session.stallRecoveries });
   try {
     if (session.hls) {
       emergencyDownshift(session);
-      if (session.stallRecoveries === 1 && bufferAhead(video) > 0.35) {
-        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 0.1);
+      const position = Math.max(0, Number(video.currentTime || 0) - 0.15);
+      if (session.stallRecoveries === 1 && bufferAhead(video) > 0.45) {
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 0.08);
+      } else {
+        try { session.hls.stopLoad(); } catch {}
+        if (session.stallRecoveries >= 3 && video.readyState < 2) {
+          try { session.hls.recoverMediaError(); } catch {}
+        }
+        session.hls.startLoad(position);
       }
-      if (session.stallRecoveries >= 2) {
-        try { session.hls.recoverMediaError(); } catch {}
-      }
-      session.hls.startLoad(Math.max(0, video.currentTime - 0.2));
+      safePlay(video).catch(() => {});
     } else if (session.dash) {
       const position = video.currentTime || 0;
       try { session.dash.setQualityFor?.('video', Math.max(0, Number(session.dash.getQualityFor?.('video') || 0) - 1)); } catch {}
@@ -353,7 +378,7 @@ function bindStallMonitor(session) {
     }
   };
   const markStall = () => {
-    if (!session.verified || video.paused || video.seeking) return;
+    if (!session.verified || video.paused || video.seeking || document.hidden || !navigator.onLine) return;
     if (!session.stallSince) {
       session.stallSince = performance.now();
       session.stallCount += 1;
@@ -372,7 +397,7 @@ function bindStallMonitor(session) {
   listen(session, video, 'stalled', markStall);
   addTimer(session, () => {
     diagnostics(session);
-    if (!session.verified || video.paused || video.ended || video.seeking || session.failed) return;
+    if (!session.verified || video.paused || video.ended || video.seeking || session.failed || document.hidden || !navigator.onLine) return;
     const now = performance.now();
     const noProgress = now - session.lastProgressAt;
     const starving = bufferAhead(video) < 0.25;
@@ -384,8 +409,8 @@ function bindStallMonitor(session) {
       return;
     }
     const stalledFor = now - session.stallSince;
-    if (stalledFor > 4500 && session.stallRecoveries < 3) recoverStall(session);
-    if (stalledFor > 18000) failSession(session, new Error('播放持续卡住，正在切换备用线路'));
+    if (stalledFor > 5000 && session.stallRecoveries < 3) recoverStall(session);
+    if (stalledFor > 20000) failSession(session, new Error('播放持续卡住，正在切换备用线路'));
   }, 3000, true);
 }
 
@@ -442,19 +467,69 @@ function waitForFirstFrame(session, timeoutMs) {
 function bindMediaState(session) {
   const { video } = session;
   const state = value => emit(video, 'state', { state: value });
+
+  const resumeAfterNetwork = () => {
+    if (session.cleaned || session.failed || !navigator.onLine) return;
+    session.offlineSince = 0;
+    session.lastProgressAt = performance.now();
+    session.stallSince = 0;
+    emit(video, 'state', { state: 'reconnecting', reason: 'online' });
+    try {
+      if (session.hls) {
+        session.hls.startLoad(Math.max(0, Number(video.currentTime || 0) - 0.15));
+      } else if (session.dash) {
+        session.dash.seek(Number(video.currentTime || 0));
+      } else {
+        video.load();
+      }
+      safePlay(video).catch(() => {});
+    } catch {}
+  };
+
   listen(session, video, 'loadstart', () => state('loading'));
-  listen(session, video, 'waiting', () => { if (!video.paused && !video.seeking) state('buffering'); });
-  listen(session, video, 'stalled', () => { if (!video.paused) state('buffering'); });
+  listen(session, video, 'waiting', () => { if (!video.paused && !video.seeking && navigator.onLine && !document.hidden) state('buffering'); });
+  listen(session, video, 'stalled', () => { if (!video.paused && navigator.onLine && !document.hidden) state('buffering'); });
   listen(session, video, 'seeking', () => state('buffering'));
-  listen(session, video, 'playing', () => { session.started = true; state('playing'); });
+  listen(session, video, 'playing', () => {
+    session.started = true;
+    requestSessionWakeLock(session);
+    state('playing');
+  });
   listen(session, video, 'canplay', () => state(video.paused ? 'ready' : 'playing'));
-  listen(session, video, 'pause', () => { if (!video.ended && !video.error) state('paused'); });
-  listen(session, video, 'ended', () => state('ended'));
+  listen(session, video, 'pause', () => {
+    releaseSessionWakeLock(session);
+    if (!video.ended && !video.error) state('paused');
+  });
+  listen(session, video, 'ended', () => {
+    releaseSessionWakeLock(session);
+    state('ended');
+  });
   listen(session, video, 'loadedmetadata', () => { session.ready = true; applyResume(session); });
   listen(session, video, 'error', () => {
     if (!session.verified || session.hls || session.dash) return;
     failSession(session, mediaError(video, '媒体播放失败'));
   });
+
+  listen(session, window, 'offline', () => {
+    session.offlineSince = performance.now();
+    session.stallSince = 0;
+    emit(video, 'state', { state: 'reconnecting', reason: 'offline' });
+  });
+  listen(session, window, 'online', resumeAfterNetwork);
+  listen(session, document, 'visibilitychange', () => {
+    if (document.hidden) {
+      session.stallSince = 0;
+      session.lastProgressAt = performance.now();
+      releaseSessionWakeLock(session);
+      return;
+    }
+    if (!video.paused && !video.ended) {
+      requestSessionWakeLock(session);
+      if (session.offlineSince && navigator.onLine) resumeAfterNetwork();
+      else safePlay(video).catch(() => {});
+    }
+  });
+
   bindStallMonitor(session);
 }
 
@@ -483,6 +558,10 @@ function deviceProfile() {
   const lowCpu = cores <= 2;
   const constrained = Boolean(connection.saveData || /(^|-)2g$/i.test(connection.effectiveType || '') || (lowMemory && lowCpu));
   const mobile = matchMedia('(max-width: 900px)').matches || matchMedia('(pointer: coarse)').matches;
+
+  // Stable startup first, deep local buffer after playback proves healthy.
+  const startupBuffer = constrained ? 24 : mobile ? 45 : 60;
+  const midBuffer = constrained ? 60 : mobile ? 100 : 150;
   const targetBuffer = constrained ? 90 : mobile ? 200 : 300;
   const maxBuffer = constrained ? 140 : mobile ? 300 : 450;
   const backBuffer = constrained ? 36 : mobile ? 100 : 160;
@@ -491,7 +570,10 @@ function deviceProfile() {
     : mobile
       ? (memory >= 8 ? 384 : 256) * 1024 * 1024
       : (memory >= 8 ? 768 : 512) * 1024 * 1024;
-  return { constrained, mobile, slowNetwork, downlink, lowMemory, lowCpu, memory, cores, targetBuffer, maxBuffer, backBuffer, maxBufferBytes };
+  return {
+    constrained, mobile, slowNetwork, downlink, lowMemory, lowCpu, memory, cores,
+    startupBuffer, midBuffer, targetBuffer, maxBuffer, backBuffer, maxBufferBytes,
+  };
 }
 
 function levelPayload(hls) {
@@ -511,6 +593,28 @@ function emitHlsTracks(session, Hls) {
   emit(session.video, 'subtitleTracks', { tracks: subtitles, current: Number(hls.subtitleTrack ?? -1) });
 }
 
+function scheduleBufferRamp(session, engine, profile, applyTarget) {
+  const stages = [
+    { delay: 6500, target: profile.midBuffer },
+    { delay: 18000, target: profile.targetBuffer },
+  ];
+  const tryApply = (stage, retries = 0) => {
+    if (session.cleaned || session.failed || session.generation !== playbackGeneration) return;
+    if (document.hidden || !navigator.onLine || session.stallSince || session.video.seeking) {
+      if (retries < 6) addTimer(session, () => tryApply(stage, retries + 1), 4000);
+      return;
+    }
+    try {
+      applyTarget(stage.target);
+      session.bufferRampStage += 1;
+      session.bufferTarget = stage.target;
+      emit(session.video, 'bufferTarget', { engine, target: stage.target });
+      diagnostics(session);
+    } catch {}
+  };
+  stages.forEach(stage => addTimer(session, () => tryApply(stage), stage.delay));
+}
+
 async function playWithHls(session) {
   const Hls = await loadHls();
   if (session.cleaned || session.generation !== playbackGeneration) throw new DOMException('播放已取消', 'AbortError');
@@ -521,7 +625,7 @@ async function playWithHls(session) {
   const defaultEstimate = downlink
     ? Math.max(900000, Math.min(12_000_000, downlink * 850000))
     : mobile ? 2_800_000 : 4_500_000;
-  session.bufferTarget = profile.targetBuffer;
+  session.bufferTarget = profile.startupBuffer;
   const hls = new Hls({
     enableWorker: true,
     lowLatencyMode: false,
@@ -540,10 +644,9 @@ async function playWithHls(session) {
     abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.76,
     maxStarvationDelay: slowNetwork ? 2 : 3.5,
     maxLoadingDelay: slowNetwork ? 2.5 : 5,
-    // Pure Player: keep a deep local buffer so playback can ride through slow or unstable sources.
-    // Mobile/tablet targets ~200s; wider desktop layouts target ~300s.
+    // Start conservatively for the first frame, then ramp to 200s/300s.
     backBufferLength: profile.backBuffer,
-    maxBufferLength: profile.targetBuffer,
+    maxBufferLength: profile.startupBuffer,
     maxMaxBufferLength: profile.maxBuffer,
     maxBufferSize: profile.maxBufferBytes,
     maxBufferHole: 0.3,
@@ -560,7 +663,7 @@ async function playWithHls(session) {
     levelLoadingMaxRetry: 3,
     levelLoadingRetryDelay: 500,
     fragLoadingTimeOut: proxied ? 12000 : 20000,
-    fragLoadingMaxRetry: proxied ? 2 : 4,
+    fragLoadingMaxRetry: proxied ? 1 : 3,
     fragLoadingRetryDelay: 600,
     fragLoadingMaxRetryTimeout: 5000,
     appendErrorMaxRetry: 3,
@@ -582,7 +685,7 @@ async function playWithHls(session) {
       const error = new Error(`播放失败：${data.details || data.type || '未知错误'}`);
       if (!session.verified) finish(error); else failSession(session, error, false);
     };
-    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), proxied ? 15000 : 22000);
+    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), proxied ? 13000 : 20000);
     hls.on(Hls.Events.MEDIA_ATTACHED, () => { if (!session.cleaned) hls.loadSource(session.url); });
     hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
       try {
@@ -605,7 +708,10 @@ async function playWithHls(session) {
       applyResume(session);
       try {
         session.autoplayBlocked = !(await safePlay(session.video));
-        await waitForFirstFrame(session, proxied ? 13000 : 18000);
+        await waitForFirstFrame(session, proxied ? 12000 : 17000);
+        scheduleBufferRamp(session, 'hls.js', profile, target => {
+          hls.config.maxBufferLength = target;
+        });
         finish();
       } catch (error) { finish(error); }
     });
@@ -624,18 +730,54 @@ async function playWithHls(session) {
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => emitHlsTracks(session, Hls));
     hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => emitHlsTracks(session, Hls));
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (!data.fatal || session.cleaned) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && session.networkRecoveries < 3) {
+      if (session.cleaned) return;
+
+      const detail = String(data?.details || '');
+      if (!data.fatal) {
+        if (/bufferStalledError|bufferNudgeOnStall/i.test(detail) && !session.video.paused && !session.video.seeking) {
+          if (!session.stallSince) {
+            session.stallSince = performance.now();
+            session.stallCount += 1;
+          }
+          emit(session.video, 'state', { state: 'buffering' });
+        }
+        if (/bufferFullError/i.test(detail)) {
+          const safeTarget = Math.max(profile.startupBuffer, Math.min(session.bufferTarget || profile.targetBuffer, profile.midBuffer));
+          hls.config.maxBufferLength = safeTarget;
+          session.bufferTarget = safeTarget;
+          emit(session.video, 'bufferTarget', { engine: 'hls.js', target: safeTarget, reason: 'memory-pressure' });
+        }
+        return;
+      }
+
+      if (!session.verified && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        fatal(data);
+        return;
+      }
+
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && session.networkRecoveries < 2) {
         const attempt = ++session.networkRecoveries;
         emergencyDownshift(session);
         emit(session.video, 'state', { state: 'reconnecting', attempt });
-        addTimer(session, () => { try { hls.startLoad(Math.max(0, session.video.currentTime || -1)); } catch { fatal(data); } }, Math.min(500 * (2 ** (attempt - 1)), 2500));
+        addTimer(session, () => {
+          if (!navigator.onLine || document.hidden) return;
+          try {
+            hls.stopLoad();
+            hls.startLoad(Math.max(0, session.video.currentTime || -1));
+            safePlay(session.video).catch(() => {});
+          } catch { fatal(data); }
+        }, Math.min(650 * (2 ** (attempt - 1)), 2200));
         return;
       }
+
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR && session.mediaRecoveries < 2) {
         const attempt = ++session.mediaRecoveries;
         emit(session.video, 'state', { state: 'recovering', attempt });
-        try { if (attempt === 2) hls.swapAudioCodec(); hls.recoverMediaError(); return; } catch { fatal(data); return; }
+        try {
+          if (attempt === 2) hls.swapAudioCodec();
+          hls.recoverMediaError();
+          return;
+        } catch { fatal(data); return; }
       }
       fatal(data);
     });
@@ -680,7 +822,7 @@ async function playWithDash(session) {
   session.engine = 'dash.js';
   emit(session.video, 'engine', { engine: 'dash.js' });
   const profile = deviceProfile();
-  session.bufferTarget = profile.targetBuffer;
+  session.bufferTarget = profile.startupBuffer;
   player.updateSettings({ streaming: {
     abr: {
       autoSwitchBitrate: { video: true, audio: true },
@@ -689,9 +831,9 @@ async function playWithDash(session) {
       useDeadTimeLatency: true,
     },
     buffer: {
-      bufferTimeDefault: profile.constrained ? 60 : profile.targetBuffer,
-      bufferTimeAtTopQuality: profile.constrained ? 90 : profile.targetBuffer,
-      bufferTimeAtTopQualityLongForm: profile.constrained ? 120 : profile.maxBuffer,
+      bufferTimeDefault: profile.startupBuffer,
+      bufferTimeAtTopQuality: profile.startupBuffer,
+      bufferTimeAtTopQualityLongForm: profile.midBuffer,
       bufferToKeep: profile.backBuffer,
       fastSwitchEnabled: true,
     },
@@ -718,6 +860,13 @@ async function playWithDash(session) {
         applyResume(session);
         session.autoplayBlocked = !(await safePlay(session.video));
         await waitForFirstFrame(session, 14000);
+        scheduleBufferRamp(session, 'dash.js', profile, target => {
+          player.updateSettings({ streaming: { buffer: {
+            bufferTimeDefault: target,
+            bufferTimeAtTopQuality: target,
+            bufferTimeAtTopQualityLongForm: Math.max(target, profile.maxBuffer),
+          } } });
+        });
         finish();
       } catch (error) { finish(error); }
     });
