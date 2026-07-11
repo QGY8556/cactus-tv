@@ -64,6 +64,8 @@ export function createPlayerUI({
 
   let hideTimer = 0;
   let gestureTimer = 0;
+  let gestureFadeTimer = 0;
+  let gestureHideToken = 0;
   let longPressTimer = 0;
   let scrubbing = false;
   let retryHandler = null;
@@ -188,9 +190,26 @@ export function createPlayerUI({
     showControls();
   }
 
-  function showGesture(content, duration = 650) {
-    const kind = typeof content === 'object' ? String(content?.kind || '') : '';
-    ui.gesture.classList.toggle('player-gesture-boost', kind === 'boost');
+  function hideGesture(delay = 0, fadeDuration = 170) {
+    clearTimeout(gestureTimer);
+    clearTimeout(gestureFadeTimer);
+    const token = ++gestureHideToken;
+    gestureTimer = window.setTimeout(() => {
+      if (token !== gestureHideToken) return;
+      ui.gesture.classList.add('is-fading');
+      gestureFadeTimer = window.setTimeout(() => {
+        if (token !== gestureHideToken) return;
+        ui.gesture.classList.add('hidden');
+        ui.gesture.classList.remove('is-fading');
+        ui.gesture.removeAttribute('data-kind');
+      }, fadeDuration);
+    }, Math.max(0, delay));
+  }
+
+  function showGesture(content, duration = 650, kind = 'default') {
+    gestureHideToken += 1;
+    clearTimeout(gestureTimer);
+    clearTimeout(gestureFadeTimer);
     if (typeof content === 'string') {
       ui.gesture.textContent = content;
     } else {
@@ -199,9 +218,9 @@ export function createPlayerUI({
       const progress = Number(content?.progress);
       ui.gesture.innerHTML = `<strong>${label}</strong>${detail ? `<small>${detail}</small>` : ''}${Number.isFinite(progress) ? `<span class="player-gesture-meter"><i style="width:${clamp(progress, 0, 1) * 100}%"></i></span>` : ''}`;
     }
-    ui.gesture.classList.remove('hidden');
-    clearTimeout(gestureTimer);
-    if (duration > 0) gestureTimer = window.setTimeout(() => ui.gesture.classList.add('hidden'), duration);
+    ui.gesture.dataset.kind = kind;
+    ui.gesture.classList.remove('hidden', 'is-fading');
+    if (duration > 0) hideGesture(duration);
   }
 
   function showTapRipple(x, y, direction) {
@@ -233,6 +252,18 @@ export function createPlayerUI({
     setIcon(ui.mute, muted ? 'muted' : 'volume');
     ui.mute.setAttribute('aria-label', muted ? '取消静音' : '静音');
     ui.volume.value = String(muted ? 0 : video.volume);
+  }
+
+  function applyVolume(value, { persist = false } = {}) {
+    const next = clamp(Number(value) || 0, 0, 1);
+    try {
+      video.volume = next;
+      video.muted = next === 0;
+    } catch {}
+    updateVolume();
+    const actual = video.muted ? 0 : clamp(Number(video.volume) || 0, 0, 1);
+    if (persist) persistPlayerPreference('cactus:player-volume', actual.toFixed(3));
+    return actual;
   }
 
   function isFullscreen() {
@@ -374,24 +405,36 @@ export function createPlayerUI({
     });
   }
 
-  function finishPointerGesture(event) {
+  function finishGestureFrame({ flush = false } = {}) {
+    if (gestureFrame) cancelAnimationFrame(gestureFrame);
+    gestureFrame = 0;
+    const update = pendingGestureUpdate;
+    pendingGestureUpdate = null;
+    if (flush) update?.();
+  }
+
+  function finishPointerGesture(event, cancelled = false) {
     const session = pointerSession;
     if (!session || (event && event.pointerId !== session.id)) return;
     clearLongPress();
+    finishGestureFrame({ flush: true });
     if (session.mode === 'boost') {
       video.playbackRate = session.previousRate;
-      showGesture({ label: `恢复 ${session.previousRate}×`, detail: '长按倍速结束' }, 420);
+      if (cancelled) hideGesture(0);
+      else showGesture({ label: `恢复 ${session.previousRate}×`, detail: '长按倍速结束' }, 360, 'boost');
       suppressClickUntil = performance.now() + 450;
     } else if (session.mode === 'seek') {
-      if (Number.isFinite(session.previewTime)) video.currentTime = session.previewTime;
-      showGesture({ label: '已定位', detail: `${formatClock(session.previewTime || 0)} / ${formatClock(video.duration || 0)}`, progress: (session.previewTime || 0) / Math.max(1, video.duration || 1) }, 520);
+      if (!cancelled && Number.isFinite(session.previewTime)) video.currentTime = session.previewTime;
+      if (cancelled) hideGesture(0);
+      else showGesture({ label: '已定位', detail: `${formatClock(session.previewTime || 0)} / ${formatClock(video.duration || 0)}`, progress: (session.previewTime || 0) / Math.max(1, video.duration || 1) }, 460, 'seek');
       suppressClickUntil = performance.now() + 450;
     } else if (session.mode === 'brightness' || session.mode === 'volume') {
       if (session.mode === 'brightness') applyBrightness(brightness, true);
-      else persistPlayerPreference('cactus:player-volume', video.volume.toFixed(3));
-      clearTimeout(gestureTimer);
-      gestureTimer = window.setTimeout(() => ui.gesture.classList.add('hidden'), 360);
+      else applyVolume(video.muted ? 0 : video.volume, { persist: true });
+      hideGesture(cancelled ? 0 : 140, 180);
       suppressClickUntil = performance.now() + 450;
+    } else {
+      hideGesture(0);
     }
     pointerSession = null;
     try { video.releasePointerCapture?.(session.id); } catch {}
@@ -399,6 +442,7 @@ export function createPlayerUI({
 
   function beginPointerGesture(event) {
     if (!coarsePointer.matches || event.pointerType === 'mouse' || event.isPrimary === false || event.button !== 0 || locked) return;
+    if (pointerSession) finishPointerGesture(null, true);
     const bounds = video.getBoundingClientRect();
     pointerSession = {
       id: event.pointerId,
@@ -426,7 +470,7 @@ export function createPlayerUI({
       navigator.vibrate?.(10);
       closeTools();
       hideControls();
-      showGesture({ kind: 'boost', label: '2× 倍速播放', detail: '松手恢复原速度' }, 0);
+      showGesture({ label: '2× 倍速播放', detail: '松手恢复原速度' }, 0, 'boost');
       suppressClickUntil = performance.now() + 450;
     }, LONG_PRESS_MS);
   }
@@ -452,18 +496,22 @@ export function createPlayerUI({
     if (session.mode === 'brightness') {
       event.preventDefault();
       const next = session.startBrightness - dy / Math.max(220, session.bounds.height * 0.78);
+      applyBrightness(next);
+      const currentBrightness = brightness;
       queueGestureUpdate(() => {
-        applyBrightness(next);
-        showGesture({ label: `亮度 ${Math.round(brightness * 100)}%`, progress: brightness }, 0);
+        showGesture({ label: `亮度 ${Math.round(currentBrightness * 100)}%`, progress: currentBrightness }, 0, 'brightness');
       });
     } else if (session.mode === 'volume') {
       event.preventDefault();
       const next = clamp(session.startVolume - dy / Math.max(220, session.bounds.height * 0.78), 0, 1);
+      const actual = applyVolume(next);
+      const blocked = Math.abs(actual - next) > 0.08;
       queueGestureUpdate(() => {
-        video.volume = next;
-        video.muted = next === 0;
-        updateVolume();
-        showGesture({ label: `音量 ${Math.round(next * 100)}%`, progress: next }, 0);
+        showGesture({
+          label: blocked ? '请使用系统音量键' : `音量 ${Math.round(actual * 100)}%`,
+          detail: blocked ? '当前浏览器不允许网页调节设备音量' : '',
+          progress: actual,
+        }, 0, 'volume');
       });
     } else if (session.mode === 'seek') {
       event.preventDefault();
@@ -482,7 +530,7 @@ export function createPlayerUI({
           label: `${signed >= 0 ? '快进' : '快退'} ${Math.abs(signed)} 秒`,
           detail: `${precision < 1 ? '精细定位 · ' : ''}${formatClock(preview)} / ${formatClock(duration)}`,
           progress: duration ? preview / duration : 0,
-        }, 0);
+        }, 0, 'seek');
       });
     }
   }
@@ -491,9 +539,9 @@ export function createPlayerUI({
   ui.centerPlay.addEventListener('click', togglePlay);
   video.addEventListener('pointerdown', beginPointerGesture);
   video.addEventListener('pointermove', movePointerGesture, { passive: false });
-  video.addEventListener('pointerup', finishPointerGesture);
-  video.addEventListener('pointercancel', finishPointerGesture);
-  video.addEventListener('lostpointercapture', finishPointerGesture);
+  video.addEventListener('pointerup', event => finishPointerGesture(event, false));
+  video.addEventListener('pointercancel', event => finishPointerGesture(event, true));
+  video.addEventListener('lostpointercapture', event => finishPointerGesture(event, true));
   video.addEventListener('contextmenu', event => { if (coarsePointer.matches) event.preventDefault(); });
   video.addEventListener('click', event => {
     if (performance.now() < suppressClickUntil) {
@@ -566,15 +614,14 @@ export function createPlayerUI({
   ui.progress.addEventListener('pointerup', () => { scrubbing = false; });
 
   ui.mute.addEventListener('click', () => {
-    video.muted = !video.muted;
-    if (!video.muted && video.volume === 0) video.volume = 0.7;
-    updateVolume();
+    if (video.muted || video.volume === 0) applyVolume(video.volume > 0 ? video.volume : 0.7, { persist: true });
+    else {
+      video.muted = true;
+      updateVolume();
+    }
   });
   ui.volume.addEventListener('input', () => {
-    video.volume = Number(ui.volume.value);
-    video.muted = video.volume === 0;
-    updateVolume();
-    persistPlayerPreference('cactus:player-volume', video.volume.toFixed(3));
+    applyVolume(Number(ui.volume.value), { persist: true });
   });
   ui.speed.addEventListener('change', () => { video.playbackRate = Number(ui.speed.value) || 1; showControls(); });
   ui.quality.addEventListener('change', () => { setQuality(Number(ui.quality.value)); showControls(); });
@@ -600,6 +647,8 @@ export function createPlayerUI({
   video.addEventListener('webkitbeginfullscreen', updateFullscreen);
   video.addEventListener('webkitendfullscreen', updateFullscreen);
   dialog.addEventListener('close', async () => {
+    finishPointerGesture(null, true);
+    hideGesture(0);
     closeTools();
     setLocked(false);
     if (document.fullscreenElement === dialog || document.webkitFullscreenElement === dialog) {
@@ -688,12 +737,19 @@ export function createPlayerUI({
       j: () => seekBy(-10), J: () => seekBy(-10),
       ArrowRight: () => seekBy(5),
       l: () => seekBy(10), L: () => seekBy(10),
-      ArrowUp: () => { video.volume = clamp(video.volume + 0.1, 0, 1); video.muted = false; updateVolume(); },
-      ArrowDown: () => { video.volume = clamp(video.volume - 0.1, 0, 1); updateVolume(); },
+      ArrowUp: () => { applyVolume((video.muted ? 0 : video.volume) + 0.1, { persist: true }); },
+      ArrowDown: () => { applyVolume((video.muted ? 0 : video.volume) - 0.1, { persist: true }); },
     };
     const action = actions[key];
     if (!action || target.tagName === 'SELECT') return;
     event.preventDefault(); action();
+  });
+
+  window.addEventListener('pointerup', event => finishPointerGesture(event, false), { capture: true });
+  window.addEventListener('pointercancel', event => finishPointerGesture(event, true), { capture: true });
+  window.addEventListener('blur', () => finishPointerGesture(null, true));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') finishPointerGesture(null, true);
   });
 
   video.addEventListener('play', updatePlayButton);
@@ -751,7 +807,7 @@ export function createPlayerUI({
   setIcon(ui.diagnostics, 'info');
   try {
     const savedVolume = Number(localStorage.getItem('cactus:player-volume'));
-    if (Number.isFinite(savedVolume)) video.volume = clamp(savedVolume, 0, 1);
+    if (Number.isFinite(savedVolume)) applyVolume(savedVolume);
   } catch {}
   applyBrightness(brightness);
   updateVolume();
@@ -760,15 +816,17 @@ export function createPlayerUI({
 
   return {
     reset() {
-      clearTimeout(hideTimer); clearTimeout(gestureTimer); clearTimeout(singleTapTimer); clearTimeout(doubleTapResetTimer); clearLongPress();
+      clearTimeout(hideTimer); clearTimeout(gestureTimer); clearTimeout(gestureFadeTimer); clearTimeout(singleTapTimer); clearTimeout(doubleTapResetTimer); clearLongPress();
       pointerSession = null; suppressClickUntil = 0;
       if (timeFrame) cancelAnimationFrame(timeFrame);
-      if (gestureFrame) cancelAnimationFrame(gestureFrame);
+      finishGestureFrame();
       timeFrame = 0; gestureFrame = 0; pendingGestureUpdate = null; lastTapTime = 0; lastTapZone = ''; lastDoubleTapAt = 0; lastDoubleTapZone = ''; doubleTapSeekTotal = 0; diagnosticsData = null; diagnosticsVisible = false;
       setLocked(false);
       closeTools();
       message.classList.add('hidden');
       ui.gesture.classList.add('hidden');
+      ui.gesture.classList.remove('is-fading');
+      ui.gesture.removeAttribute('data-kind');
       applyBrightness(brightness);
       ui.diagnosticsPanel?.classList.add('hidden');
       ui.diagnostics?.classList.remove('active');
