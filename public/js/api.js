@@ -98,20 +98,16 @@ export const api = {
   health: () => requestJson('/api/health', { cacheTtl: 5 * 60_000, timeout: 8_000 }),
   home: () => requestJson('/api/home', { cacheTtl: 30 * 60_000, timeout: 12_000 }),
   search: (query, signal) => requestJson(`/api/search?q=${encodeURIComponent(query)}`, {
-    cacheTtl: 0,
+    cacheTtl: 2 * 60_000,
     dedupe: false,
     signal,
-    timeout: 20_000,
+    timeout: 15_000,
   }),
   detail: (provider, id, signal) => requestJson(`/api/detail?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`, {
-    // Playback URLs and proxy settings can change at any moment. Caching detail
-    // for ten minutes kept broken v0.8.4 proxy URLs alive even after the user
-    // disabled proxy in the admin page.
     cacheTtl: 0,
-    cache: 'no-store',
     dedupe: false,
     signal,
-    timeout: 14_000,
+    timeout: 15_000,
   }),
   clear() {
     memoryCache.clear();

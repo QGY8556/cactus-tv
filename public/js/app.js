@@ -1,5 +1,6 @@
-import { api } from './api.js?v=0.8.6';
-import { store } from './storage.js?v=0.8.6';
+import { api } from './api.js?v=1.1.0';
+import { store } from './storage.js?v=1.1.0';
+import { buildPersonalizedHome } from './recommend.js?v=1.1.0';
 
 const $ = selector => document.querySelector(selector);
 const els = {
@@ -13,17 +14,11 @@ const els = {
   detailDialog: $('#detailDialog'), detailContent: $('#detailContent'),
   playerDialog: $('#playerDialog'), playerShell: $('#videoShell'), player: $('#videoPlayer'), playerTitle: $('#playerTitle'),
   playerSubtitle: $('#playerSubtitle'), playerMessage: $('#playerMessage'), playerRetry: $('#playerRetry'),
-  playerStreamflow: $('#playerStreamflow'), playerStreamflowState: $('#playerStreamflowState'),
-  playerStreamflowDetail: $('#playerStreamflowDetail'), playerStreamflowProgress: $('#playerStreamflowProgress'),
-  playerStreamflowClose: $('#playerStreamflowClose'), playerStreamflowChip: $('#playerStreamflowChip'),
-  playerStreamflowChipText: $('#playerStreamflowChipText'),
   playerPrev: $('#playerPrev'), playerNext: $('#playerNext'), playerSwitchSource: $('#playerSwitchSource'), playbackStatus: $('#playbackStatus'),
   nextEpisodePrompt: $('#nextEpisodePrompt'), nextEpisodeText: $('#nextEpisodeText'), nextEpisodeNow: $('#nextEpisodeNow'), nextEpisodeCancel: $('#nextEpisodeCancel'),
   subtitleSelect: $('#subtitleSelect'), subtitleFile: $('#subtitleFile'), resumeHint: $('#resumeHint'),
   settingsDialog: $('#settingsDialog'), settingsButton: $('#settingsButton'), historyToggle: $('#historyToggle'),
-  nativeHlsToggle: $('#nativeHlsToggle'), resumeToggle: $('#resumeToggle'), failoverToggle: $('#failoverToggle'), autoNextToggle: $('#autoNextToggle'),
-  streamflowToggle: $('#streamflowToggle'), streamflowStatus: $('#streamflowStatus'), streamflowSessions: $('#streamflowSessions'),
-  streamflowRefresh: $('#streamflowRefresh'), streamflowClear: $('#streamflowClear'),
+  nativeHlsToggle: $('#nativeHlsToggle'), resumeToggle: $('#resumeToggle'), failoverToggle: $('#failoverToggle'), autoNextToggle: $('#autoNextToggle'), cleanStreamToggle: $('#cleanStreamToggle'), recommendationToggle: $('#recommendationToggle'),
   sourcePills: $('#sourcePills'), metadataCredit: $('#metadataCredit'), toast: $('#toast'),
 };
 
@@ -50,6 +45,7 @@ const PLAYBACK_MAX_ATTEMPTS = 7;
 let currentView = 'home';
 let settings = store.settings();
 let featuredItem = null;
+let rawHomeSectionsData = [];
 let homeSectionsData = [];
 let currentResults = [];
 let currentResultContext = 'results';
@@ -68,31 +64,25 @@ let routeApplying = false;
 let nextEpisodeTimer = 0;
 let nextEpisodeDeadline = 0;
 let nextEpisodeTarget = null;
-let streamflowBackendReady = false;
-let streamflowGeneration = 1;
-let streamflowPulseTimer = 0;
-let streamflowStatusTimer = 0;
-let streamflowPanelTimer = 0;
-let streamflowPanelExpanded = (() => {
-  try { return localStorage.getItem('cactus:streamflow-panel:v1') !== 'collapsed'; } catch { return true; }
-})();
 
 els.historyToggle.checked = settings.recordHistory;
 els.nativeHlsToggle.checked = settings.preferNativeHls;
 els.resumeToggle.checked = settings.resumePlayback;
 els.failoverToggle.checked = settings.autoFailover;
 els.autoNextToggle.checked = settings.autoNext;
-els.streamflowToggle.checked = settings.streamflowEnabled !== false;
+els.cleanStreamToggle.checked = settings.cleanStreamEnabled !== false;
+els.recommendationToggle.checked = settings.personalizedRecommendations !== false;
 
 const deviceProfile = Object.freeze({
   saveData: Boolean(navigator.connection?.saveData),
-  lowMemory: Boolean(navigator.deviceMemory && navigator.deviceMemory <= 4),
-  lowCpu: Boolean(navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4),
+  lowMemory: Boolean(navigator.deviceMemory && navigator.deviceMemory <= 2),
+  lowCpu: Boolean(navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 2),
   reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
   coarsePointer: matchMedia('(pointer: coarse)').matches,
   narrow: matchMedia('(max-width: 1024px)').matches,
 });
-const lowPowerMode = deviceProfile.saveData || deviceProfile.lowMemory || deviceProfile.lowCpu || deviceProfile.reducedMotion;
+const weakHardware = deviceProfile.lowMemory && deviceProfile.lowCpu;
+const lowPowerMode = deviceProfile.saveData || weakHardware || deviceProfile.reducedMotion;
 document.documentElement.classList.toggle('performance-lite', lowPowerMode);
 document.documentElement.classList.toggle('touch-device', deviceProfile.coarsePointer);
 
@@ -125,8 +115,8 @@ async function ensurePlayerModules() {
   if (playerApi && playerUI) return playerApi;
   if (!playerModulesPromise) {
     playerModulesPromise = Promise.all([
-      import('./player.js?v=0.8.6'),
-      import('./player-ui.js?v=0.8.6'),
+      import('./player.js?v=1.1.0'),
+      import('./player-ui.js?v=1.1.0'),
     ]).then(([apiModule, uiModule]) => {
       playerApi = apiModule;
       playerUI = uiModule.createPlayerUI({
@@ -389,8 +379,10 @@ function cardHtml(item, index, context = 'results', priority = false) {
   return `<article class="media-card" tabindex="0" role="button" aria-label="查看 ${escapeHtml(name)}" data-index="${index}" data-context="${context}">
     <div class="poster${portraitOnly ? ' poster-portrait-source' : ''}">${image}
       ${item.remarks ? `<span class="badge">${escapeHtml(item.remarks)}</span>` : rating ? `<span class="rating">★ ${rating.toFixed(1)}</span>` : ''}
+      ${item._recommendReason ? `<span class="recommend-reason">${escapeHtml(item._recommendReason)}</span>` : ''}
       ${canFavorite ? `<button type="button" class="favorite-button ${favorite ? 'active' : ''}" data-favorite="${escapeHtml(key)}" aria-label="${favorite ? '取消收藏' : '收藏'}">${favorite ? '♥' : '+'}</button>` : ''}
       <div class="card-overlay"><strong>${escapeHtml(name)}</strong><div class="card-meta">${primaryMeta ? `<span class="match">${escapeHtml(primaryMeta)}</span>` : ''}${item.year ? `<span>${escapeHtml(item.year)}</span>` : ''}${type ? `<span>${escapeHtml(type)}</span>` : ''}</div></div>
+      ${Number(item._progress || 0) > 0 ? `<span class="watch-progress" aria-label="已观看 ${Math.round(Number(item._progress) * 100)}%"><i style="width:${Math.max(2, Math.min(100, Number(item._progress) * 100))}%"></i></span>` : ''}
     </div>
   </article>`;
 }
@@ -406,7 +398,7 @@ function bindCards(container, items, context) {
       toggleFavorite(item, favoriteButton);
       return;
     }
-    if (['home', 'catalog'].includes(context) || !item.provider) {
+    if ((['home', 'catalog'].includes(context) && item._homeAction !== 'detail') || !item.provider) {
       const query = titleOf(item);
       els.searchInput.value = query;
       await search(query);
@@ -527,13 +519,33 @@ function render(items, title, kicker, options = {}) {
   renderResultBatch({ reset: true });
 }
 
+function composeHomeSections(sections = rawHomeSectionsData) {
+  return buildPersonalizedHome(
+    sections,
+    store.history(),
+    store.favorites(),
+    { enabled: settings.personalizedRecommendations !== false },
+  );
+}
+
+function refreshPersonalizedHome({ preserveScroll = true } = {}) {
+  if (!rawHomeSectionsData.length) return;
+  const scrollTop = preserveScroll ? window.scrollY : 0;
+  homeSectionsData = composeHomeSections(rawHomeSectionsData);
+  if (currentView === 'home') {
+    renderHome(homeSectionsData);
+    if (preserveScroll && scrollTop > 0) requestAnimationFrame(() => window.scrollTo({ top: scrollTop, behavior: 'auto' }));
+  }
+}
+
 function renderCategoryNav(activeId = '') {
   if (!homeSectionsData.length) {
     els.categoryNav.classList.add('hidden');
     return;
   }
+  const categories = homeSectionsData.filter(section => !section.personalized);
   els.categoryNav.classList.remove('hidden');
-  els.categoryNav.innerHTML = `<button class="category-chip ${activeId ? '' : 'active'}" data-category="" type="button">全部</button>${homeSectionsData.map(section => `<button class="category-chip ${activeId === section.id ? 'active' : ''}" data-category="${escapeHtml(section.id)}" type="button">${escapeHtml(section.title)}</button>`).join('')}`;
+  els.categoryNav.innerHTML = `<button class="category-chip ${activeId ? '' : 'active'}" data-category="" type="button">全部</button>${categories.map(section => `<button class="category-chip ${activeId === section.id ? 'active' : ''}" data-category="${escapeHtml(section.id)}" type="button">${escapeHtml(section.title)}</button>`).join('')}`;
   els.categoryNav.querySelectorAll('[data-category]').forEach(button => button.addEventListener('click', () => {
     const id = button.dataset.category;
     if (!id) navigate('/');
@@ -602,9 +614,9 @@ function renderHome(sections) {
     return;
   }
 
-  const firstSection = homeSectionsData.find(section => section.items?.length);
+  const firstSection = homeSectionsData.find(section => section.id === 'for-you' && section.items?.length) || homeSectionsData.find(section => !section.personalized && section.items?.length) || homeSectionsData.find(section => section.items?.length);
   renderHero(firstSection?.items?.[0]);
-  els.homeSections.innerHTML = homeSectionsData.map((section, sectionIndex) => `<section class="catalog-section${sectionIndex === 0 ? ' is-visible' : ''}" data-catalog="${sectionIndex}">
+  els.homeSections.innerHTML = homeSectionsData.map((section, sectionIndex) => `<section class="catalog-section${sectionIndex === 0 ? ' is-visible' : ''}${section.personalized ? ' personalized-section' : ''}" data-catalog="${sectionIndex}">
     <div class="section-heading"><h2>${escapeHtml(section.title)}</h2>
       <div class="row-controls" aria-label="滚动片单"><button type="button" class="row-control" data-row="${sectionIndex}" data-dir="-1" aria-label="向左">‹</button><button type="button" class="row-control" data-row="${sectionIndex}" data-dir="1" aria-label="向右">›</button></div>
     </div>
@@ -614,7 +626,7 @@ function renderHome(sections) {
   homeSectionsData.forEach((section, index) => {
     const row = els.homeSections.querySelector(`[data-section="${index}"]`);
     appendHomeCards(row, index, index === 0 ? HOME_INITIAL_CARDS + 2 : HOME_INITIAL_CARDS);
-    bindCards(row, section.items || [], 'home');
+    bindCards(row, section.items || [], section.id === 'continue' ? 'home-personal' : 'home');
     // The first two shelves are prepared immediately after first paint, not after a swipe.
     if (index < 2) scheduleHomeRowPreload(row, index, index === 0 ? HOME_PRELOAD_SCREENS + .5 : HOME_PRELOAD_SCREENS);
     let rowFrame = 0;
@@ -676,11 +688,13 @@ function toggleFavorite(item, button) {
   button.textContent = active ? '♥' : '+';
   button.setAttribute('aria-label', active ? '取消收藏' : '收藏');
   if (currentView === 'favorites') renderSavedView('favorites', { push: false });
+  else if (currentView === 'home') idle(() => refreshPersonalizedHome(), 500);
 }
 
 async function loadHome({ render = true } = {}) {
   const payload = await api.home();
-  homeSectionsData = payload.sections || [];
+  rawHomeSectionsData = payload.sections || [];
+  homeSectionsData = composeHomeSections(rawHomeSectionsData);
   if (render) renderHome(homeSectionsData);
   if (payload.notice) showNotice(payload.notice, 'warning');
   return payload;
@@ -763,26 +777,24 @@ function candidatesForDetail(detail, target, preferred = {}) {
       const url = episode.playbackUrl || episode.url;
       if (!url) return;
       const basePriority = exactPreferred ? -1000 : lineIndex;
-      const baseCandidate = {
+      candidates.push({
         detail, episode, lineIndex, episodeIndex,
         lineName: line.name || `线路 ${lineIndex + 1}`,
         provider: detail.provider,
         providerName: detail.providerName,
         url,
         priority: basePriority,
-        transport: episode.proxied ? 'proxy' : 'direct',
-      };
-      candidates.push(baseCandidate);
-
-      // A proxy failure must never make the original playable URL disappear.
-      // Keep a direct candidate immediately behind the proxied candidate. The
-      // normal failover logic will use it only when the proxy path fails.
-      if (episode.proxied && episode.url && episode.url !== url) {
+        directFallback: false,
+      });
+      if (episode.url && episode.url !== url) {
         candidates.push({
-          ...baseCandidate,
+          detail, episode, lineIndex, episodeIndex,
+          lineName: `${line.name || `线路 ${lineIndex + 1}`} · 直连`,
+          provider: detail.provider,
+          providerName: detail.providerName,
           url: episode.url,
           priority: basePriority + 0.25,
-          transport: 'direct-fallback',
+          directFallback: true,
         });
       }
     });
@@ -795,15 +807,13 @@ function candidatesForDetail(detail, target, preferred = {}) {
       candidates.push({
         detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
         lineName: fallbackLine.name || '线路 1', provider: detail.provider, providerName: detail.providerName,
-        url: fallbackUrl, priority: 999, transport: fallbackEpisode.proxied ? 'proxy' : 'direct',
+        url: fallbackUrl, priority: 999, directFallback: false,
       });
-      if (fallbackEpisode.proxied && fallbackEpisode.url && fallbackEpisode.url !== fallbackUrl) {
-        candidates.push({
-          detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
-          lineName: fallbackLine.name || '线路 1', provider: detail.provider, providerName: detail.providerName,
-          url: fallbackEpisode.url, priority: 999.25, transport: 'direct-fallback',
-        });
-      }
+      if (fallbackEpisode.url && fallbackEpisode.url !== fallbackUrl) candidates.push({
+        detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
+        lineName: `${fallbackLine.name || '线路 1'} · 直连`, provider: detail.provider, providerName: detail.providerName,
+        url: fallbackEpisode.url, priority: 999.25, directFallback: true,
+      });
     }
   }
   return candidates.sort((a, b) => {
@@ -1041,351 +1051,26 @@ function mediaSessionFor(candidate) {
 
 
 
-function fallbackHash(value) {
-  const seeds = [2166136261, 2246822519, 3266489917, 668265263, 374761393, 2654435761, 1597334677, 3812015801];
-  return seeds.map(seed => {
-    let hash = seed >>> 0;
-    for (let index = 0; index < value.length; index += 1) {
-      hash ^= value.charCodeAt(index);
-      hash = Math.imul(hash, 16777619) >>> 0;
-    }
-    return hash.toString(16).padStart(8, '0');
-  }).join('');
-}
-
-async function sha256Hex(value) {
+function playerBufferAhead() {
+  const video = els.player;
+  const current = Number(video.currentTime || 0);
+  let end = current;
   try {
-    const bytes = new TextEncoder().encode(value);
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-  } catch { return fallbackHash(value); }
-}
-
-function proxiedStreamflowSource(candidate) {
-  try {
-    const url = new URL(candidate?.url || '', location.href);
-    if (url.origin !== location.origin || url.pathname !== '/api/stream') return null;
-    const provider = url.searchParams.get('provider') || candidate?.provider || '';
-    const sourceUrl = url.searchParams.get('url') || '';
-    if (!provider || !/^https:\/\//i.test(sourceUrl)) return null;
-    return {
-      provider,
-      sourceUrl,
-      proxyUrl: url,
-    };
-  } catch { return null; }
-}
-
-function streamflowUnavailableReason(candidate) {
-  if (settings.streamflowEnabled === false) return '已在设置中关闭 CactusStreamflow';
-  if (!streamflowBackendReady) return 'Cloudflare Cache API 尚未就绪';
-  if (!candidate) return '尚未选择播放线路';
-  const episode = candidate.episode || {};
-  if (episode.proxyReason) return episode.proxyReason;
-  try {
-    const url = new URL(candidate.url || '', location.href);
-    if (url.origin !== location.origin || url.pathname !== '/api/stream') {
-      const host = episode.mediaHost || new URL(episode.url || candidate.url || '', location.href).hostname;
-      return host
-        ? `当前线路 ${host} 未经过受控代理，无法建立边缘缓存`
-        : '当前线路未经过受控播放代理';
+    for (let index = 0; index < video.buffered.length; index += 1) {
+      if (video.buffered.start(index) <= current + 0.5) end = Math.max(end, video.buffered.end(index));
     }
   } catch {}
-  return '当前线路缺少可用的代理片源信息';
+  return Math.max(0, end - current);
 }
 
-async function prepareStreamflow(playback, candidate) {
-  playback.streamflowIssue = '';
-  if (!settings.streamflowEnabled || !streamflowBackendReady) {
-    playback.streamflowIssue = streamflowUnavailableReason(candidate);
-    return null;
-  }
-  const source = proxiedStreamflowSource(candidate);
-  if (!source) {
-    playback.streamflowIssue = streamflowUnavailableReason(candidate);
-    return null;
-  }
-  let stableSourcePath = '';
-  try { stableSourcePath = new URL(source.sourceUrl).pathname; } catch {}
-  const identity = [
-    playback.canonicalKey,
-    playback.target?.identity || playback.target?.name || '',
-    candidate.provider,
-    candidate.lineIndex,
-    candidate.episodeIndex,
-    stableSourcePath,
-  ].join('|');
-  const id = await sha256Hex(identity);
-  const playUrl = new URL(source.proxyUrl);
-  playUrl.searchParams.set('sf', id);
-  playUrl.searchParams.set('sfg', String(streamflowGeneration));
-  playUrl.searchParams.delete('sfi');
-  playUrl.searchParams.delete('sft');
-  return {
-    id,
-    provider: source.provider,
-    sourceUrl: source.sourceUrl,
-    playUrl: `${playUrl.pathname}${playUrl.search}`,
-    generation: streamflowGeneration,
-  };
-}
-
-function clearStreamflowTimers() {
-  if (streamflowPulseTimer) clearInterval(streamflowPulseTimer);
-  if (streamflowStatusTimer) clearTimeout(streamflowStatusTimer);
-  streamflowPulseTimer = 0;
-  streamflowStatusTimer = 0;
-  clearStreamflowPanelTimer();
-}
-
-function streamflowDeliveryText(playback) {
-  const metrics = playback?.streamflowMetrics || {};
-  const hits = Number(metrics.hits || 0);
-  const misses = Number(metrics.misses || 0);
-  const total = hits + misses;
-  if (!total) return '播放命中 —';
-  return `播放命中 ${hits}/${total}（${Math.round((hits / total) * 100)}%）`;
-}
-
-function clearStreamflowPanelTimer() {
-  if (streamflowPanelTimer) clearTimeout(streamflowPanelTimer);
-  streamflowPanelTimer = 0;
-}
-
-function applyStreamflowPanelVisibility() {
-  const active = Boolean(currentPlayback && els.playerDialog.open);
-  els.playerStreamflow?.classList.toggle('hidden', !active || !streamflowPanelExpanded);
-  els.playerStreamflowChip?.classList.toggle('hidden', !active || streamflowPanelExpanded);
-}
-
-function setStreamflowPanelExpanded(expanded, persist = true) {
-  streamflowPanelExpanded = Boolean(expanded);
-  clearStreamflowPanelTimer();
-  if (persist) {
-    try { localStorage.setItem('cactus:streamflow-panel:v1', expanded ? 'expanded' : 'collapsed'); } catch {}
-  }
-  applyStreamflowPanelVisibility();
-}
-
-function scheduleStreamflowPanelCollapse(delay = 8000) {
-  if (!streamflowPanelExpanded || streamflowPanelTimer) return;
-  streamflowPanelTimer = setTimeout(() => {
-    streamflowPanelTimer = 0;
-    setStreamflowPanelExpanded(false);
-  }, delay);
-}
-
-function updateStreamflowChip(text = '等待') {
-  if (els.playerStreamflowChipText) els.playerStreamflowChipText.textContent = text;
-}
-
-function renderPlayerStreamflow(status = null, heartbeat = null) {
-  const playback = currentPlayback;
-  if (!els.playerStreamflow || !playback || !els.playerDialog.open) {
-    els.playerStreamflow?.classList.add('hidden');
-    els.playerStreamflowChip?.classList.add('hidden');
-    return;
-  }
-
-  els.playerStreamflow.classList.remove('streamflow-ready', 'streamflow-error');
-  applyStreamflowPanelVisibility();
-
-  if (settings.streamflowEnabled === false) {
-    els.playerStreamflowState.textContent = '已关闭';
-    els.playerStreamflowDetail.textContent = '可在设置中重新开启 600 秒边缘流式缓存';
-    els.playerStreamflowProgress.style.width = '0%';
-    els.playerStreamflow.classList.add('streamflow-error');
-    updateStreamflowChip('已关闭');
-    return;
-  }
-
-  if (!playback.streamflow) {
-    els.playerStreamflowState.textContent = '未启动';
-    els.playerStreamflowDetail.textContent = playback.streamflowIssue || streamflowUnavailableReason(playback.currentCandidate);
-    els.playerStreamflowProgress.style.width = '0%';
-    els.playerStreamflow.classList.add('streamflow-error');
-    updateStreamflowChip('未启动');
-    return;
-  }
-
-  const position = Number.isFinite(els.player.currentTime) ? els.player.currentTime : Number(status?.position || 0);
-  const duration = Number.isFinite(els.player.duration) ? els.player.duration : Number(status?.duration || 0);
-  if (!status) {
-    const durationReady = Boolean(heartbeat?.eligible || (duration > 0 && position < duration - 5));
-    els.playerStreamflowState.textContent = durationReady ? '准备预取' : '等待视频信息';
-    els.playerStreamflowDetail.textContent = durationReady
-      ? '代理链路已建立，正在创建前方 600 秒缓存游标'
-      : '代理链路已建立；识别到 HLS 时立即开始预取';
-    els.playerStreamflowProgress.style.width = durationReady ? '2%' : '0%';
-    updateStreamflowChip(durationReady ? '准备中' : '等待');
-    scheduleStreamflowPanelCollapse();
-    return;
-  }
-
-  playback.streamflowStatus = status;
-  const targetAhead = Math.max(0, Number(status.targetEnd || 0) - position);
-  const cachedAhead = Math.max(0, Number(status.cachedThrough || 0) - position);
-  const percent = targetAhead > 0 ? Math.max(0, Math.min(100, (cachedAhead / targetAhead) * 100)) : 100;
-  const ready = Boolean(status.complete || (targetAhead > 0 && cachedAhead >= targetAhead - 1));
-  const state = status.state === 'error'
-    ? '预取受阻'
-    : ready
-      ? '目标已覆盖'
-      : els.player.paused
-        ? '暂停预取中'
-        : '流式预取中';
-  els.playerStreamflowState.textContent = state;
-  const batch = `新增 ${Number(status.totalStored || 0)} · 复用 ${Number(status.totalHits || 0)}`;
-  const delivery = streamflowDeliveryText(playback);
-  els.playerStreamflowDetail.textContent = status.state === 'error'
-    ? `${status.lastError || playback.streamflowIssue || '部分片源暂时无法预取'} · ${delivery}`
-    : `${Math.round(cachedAhead)} / ${Math.round(targetAhead)} 秒 · ${batch} · ${delivery}`;
-  els.playerStreamflowProgress.style.width = `${percent}%`;
-  updateStreamflowChip(status.state === 'error' ? '受阻' : `${Math.round(cachedAhead)}/${Math.round(targetAhead)}s`);
-  els.playerStreamflow.classList.toggle('streamflow-ready', ready);
-  els.playerStreamflow.classList.toggle('streamflow-error', status.state === 'error');
-  if (status.state !== 'error') scheduleStreamflowPanelCollapse(ready ? 5000 : 9000);
-
-  if (ready && streamflowPulseTimer) {
-    clearInterval(streamflowPulseTimer);
-    streamflowPulseTimer = 0;
-  }
-}
-
-function scheduleStreamflowStatusPoll(delay = 1800) {
-  if (streamflowStatusTimer) clearTimeout(streamflowStatusTimer);
-  streamflowStatusTimer = setTimeout(() => {
-    streamflowStatusTimer = 0;
-    refreshActiveStreamflowStatus().catch(() => {});
-  }, delay);
-}
-
-async function refreshActiveStreamflowStatus() {
-  const playback = currentPlayback;
-  const streamflow = playback?.streamflow;
-  if (!playback || !streamflow || !els.playerDialog.open) return null;
-  const params = new URLSearchParams({ id: streamflow.id });
-  const response = await fetch(`/api/cache/status?${params}`, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: { Accept: 'application/json' },
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || '缓存进度读取失败');
-  if (payload.session) renderPlayerStreamflow(payload.session);
-  return payload.session || null;
-}
-
-function startPausedStreamflowPulse() {
-  if (streamflowPulseTimer) clearInterval(streamflowPulseTimer);
-  if (!currentPlayback?.streamflow || !currentPlayback.streamflowCanPrefetch || settings.streamflowEnabled === false) return;
-  streamflowPulseTimer = setInterval(() => {
-    if (!currentPlayback || !els.playerDialog.open || !els.player.paused || els.player.ended) {
-      clearInterval(streamflowPulseTimer);
-      streamflowPulseTimer = 0;
-      return;
-    }
-    if (currentPlayback.streamflowStatus?.complete) {
-      clearInterval(streamflowPulseTimer);
-      streamflowPulseTimer = 0;
-      return;
-    }
-    sendStreamflowHeartbeat('paused').catch(() => {});
-  }, 18000);
-}
-
-async function sendStreamflowHeartbeat(phase = 'playing', keepalive = false, allowDisabled = false) {
-  const playback = currentPlayback;
-  const streamflow = playback?.streamflow;
-  const candidate = playback?.currentCandidate;
-  if (!playback || !streamflow || !candidate || (!settings.streamflowEnabled && !allowDisabled)) return false;
-  if (!playback.streamflowCanPrefetch && ['playing', 'paused'].includes(phase)) return false;
-  if (playback.streamflowRequestInFlight && !keepalive) return false;
-  const payload = {
-    id: streamflow.id,
-    itemKey: playback.canonicalKey,
-    provider: streamflow.provider,
-    sourceUrl: streamflow.sourceUrl,
-    title: candidate.detail?.name || playback.detail?.name || '',
-    episodeName: candidate.episode?.name || playback.episode?.name || '',
-    lineIndex: candidate.lineIndex ?? playback.preferred.lineIndex,
-    episodeIndex: candidate.episodeIndex ?? playback.preferred.episodeIndex,
-    position: Number.isFinite(els.player.currentTime) ? els.player.currentTime : 0,
-    duration: Number.isFinite(els.player.duration) ? els.player.duration : 0,
-    phase,
-    enabled: settings.streamflowEnabled !== false,
-    generation: streamflow.generation || streamflowGeneration,
-  };
-  playback.lastStreamflowSync = Date.now();
-  playback.streamflowRequestInFlight = true;
+function applyCleanStream(url) {
+  if (settings.cleanStreamEnabled === false) return url;
   try {
-    const response = await fetch('/api/cache/heartbeat', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(payload),
-      keepalive,
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      if (response.status === 503) streamflowBackendReady = false;
-      throw new Error(data.error || `CactusStreamflow 同步失败（${response.status}）`);
-    }
-    renderPlayerStreamflow(data.status || null, data);
-    if (data.prefetchScheduled) scheduleStreamflowStatusPoll(1800);
-    return true;
-  } catch (error) {
-    playback.streamflowIssue = error?.message || 'CactusStreamflow 同步失败';
-    if (!keepalive) {
-      console.warn(error);
-      const previous = playback.streamflowStatus || {};
-      renderPlayerStreamflow({
-        ...previous,
-        state: 'error',
-        lastError: playback.streamflowIssue,
-        targetEnd: previous.targetEnd || 0,
-        cachedThrough: previous.cachedThrough || 0,
-      });
-    }
-    return false;
-  } finally {
-    playback.streamflowRequestInFlight = false;
-  }
-}
-
-function renderStreamflowStatus(payload) {
-  if (!els.streamflowStatus || !els.streamflowSessions) return;
-  if (!payload?.ready) {
-    els.streamflowStatus.textContent = '当前运行环境不支持 Cache API';
-    els.streamflowSessions.innerHTML = '';
-    els.streamflowClear.disabled = true;
-    return;
-  }
-  const generation = Number(payload.generation || streamflowGeneration || 1);
-  streamflowGeneration = generation;
-  els.streamflowStatus.textContent = `Cloudflare Cache API · 缓存代数 ${generation}`;
-  els.streamflowSessions.innerHTML = [
-    '<div class="streamflow-session"><strong>边看边缓存</strong><small>实际播放过的 HLS 分片会写入当前 Cloudflare 边缘节点，命中时直接返回。</small></div>',
-    '<div class="streamflow-session"><strong>600 秒滚动窗口</strong><small>从开始播放就利用缓存游标分批向后推进；播放中持续续批，暂停时每 18 秒续一批，直到覆盖未来 600 秒或抵达片尾。</small></div>',
-    '<div class="streamflow-session"><strong>性能可视化</strong><small>播放器会显示已覆盖秒数、新增/复用分片以及 HLS.js 实际播放命中率；原生 HLS 只能显示预取进度。</small></div>',
-    '<div class="streamflow-session"><strong>临时边缘缓存</strong><small>不保证永久保存；切换网络或地区后可能落到其他节点而未命中。</small></div>',
-  ].join('');
-  els.streamflowClear.disabled = false;
-}
-
-async function loadStreamflowStatus() {
-  if (!els.streamflowStatus) return;
-  els.streamflowRefresh.disabled = true;
-  try {
-    const response = await fetch('/api/cache/status', { credentials: 'same-origin', headers: { Accept: 'application/json' } });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || '缓存状态读取失败');
-    streamflowBackendReady = Boolean(payload.ready);
-    streamflowGeneration = Number(payload.generation || streamflowGeneration || 1);
-    renderStreamflowStatus(payload);
-  } catch (error) {
-    els.streamflowStatus.textContent = error.message || '缓存状态读取失败';
-  } finally { els.streamflowRefresh.disabled = false; }
+    const parsed = new URL(url, location.href);
+    if (parsed.origin !== location.origin || parsed.pathname !== '/api/stream') return url;
+    parsed.searchParams.set('clean', '1');
+    return `${parsed.pathname}${parsed.search}`;
+  } catch { return url; }
 }
 
 async function startCandidate(playback, candidate, startAt) {
@@ -1394,14 +1079,7 @@ async function startCandidate(playback, candidate, startAt) {
   playback.detail = candidate.detail;
   playback.episode = candidate.episode;
   playback.playUrl = candidate.url;
-  clearStreamflowTimers();
-  playback.streamflowStatus = null;
-  playback.streamflowIssue = '';
-  playback.streamflowMetrics = { hits: 0, misses: 0 };
-  playback.streamflowCanPrefetch = false;
-  playback.streamflow = await prepareStreamflow(playback, candidate);
-  playback.activePlayUrl = playback.streamflow?.playUrl || candidate.url;
-  renderPlayerStreamflow();
+  playback.activePlayUrl = applyCleanStream(candidate.url);
   playback.starting = true;
   playback.successRecorded = false;
   playback.lastStartupMs = 0;
@@ -1425,7 +1103,6 @@ async function startCandidate(playback, candidate, startAt) {
     const startup = Number(playback.lastStartupMs || 0);
     setPlaybackStatus(`${candidate.providerName || candidate.provider} · ${candidate.lineName}${startup ? ` · 首帧 ${startup}ms` : ''}`, 'ready');
     replaceWatchRoute(candidate, playback);
-    renderPlayerStreamflow();
   } catch (error) {
     playback.starting = false;
     store.recordSourceFailure(candidate.provider, candidateHealthKey(candidate));
@@ -1504,9 +1181,7 @@ async function openPlayer(detail, episode, options = {}) {
     failureHandling: false, starting: false, lastSync: 0,
     attemptCount: 0, baseAttempts: 0, failoverStartedAt: performance.now(),
     successRecorded: false, prewarmedNext: '', lastStartupMs: 0,
-    streamflow: null, activePlayUrl: '', lastStreamflowSync: 0,
-    streamflowRequestInFlight: false, streamflowStatus: null, streamflowIssue: '', streamflowMetrics: { hits: 0, misses: 0 },
-    streamflowCanPrefetch: false,
+    activePlayUrl: '', lastPlaybackPressureAt: Date.now(),
   };
   resetCandidatePool(currentPlayback);
   playerUI.setRetry(() => {
@@ -1767,70 +1442,21 @@ els.playerDialog.addEventListener('cancel', event => { event.preventDefault(); c
 
 els.settingsButton.addEventListener('click', () => {
   els.settingsDialog.showModal();
-  loadStreamflowStatus().catch(() => {});
 });
-[els.historyToggle, els.nativeHlsToggle, els.resumeToggle, els.failoverToggle, els.autoNextToggle, els.streamflowToggle].forEach(input => input.addEventListener('change', () => {
-  const wasStreamflowEnabled = settings.streamflowEnabled !== false;
+[els.historyToggle, els.nativeHlsToggle, els.resumeToggle, els.failoverToggle, els.autoNextToggle, els.cleanStreamToggle, els.recommendationToggle].forEach(input => input.addEventListener('change', () => {
   settings = {
     recordHistory: els.historyToggle.checked,
     preferNativeHls: els.nativeHlsToggle.checked,
     resumePlayback: els.resumeToggle.checked,
     autoFailover: els.failoverToggle.checked,
     autoNext: els.autoNextToggle.checked,
-    streamflowEnabled: els.streamflowToggle.checked,
+    cleanStreamEnabled: els.cleanStreamToggle.checked,
+    personalizedRecommendations: els.recommendationToggle.checked,
   };
   store.saveSettings(settings);
   if (!settings.autoNext) cancelNextEpisode();
-  if (wasStreamflowEnabled && !settings.streamflowEnabled) {
-    sendStreamflowHeartbeat('exit', true, true).catch(() => {});
-    clearStreamflowTimers();
-    if (currentPlayback) {
-      currentPlayback.streamflowIssue = '已在设置中关闭 CactusStreamflow';
-      renderPlayerStreamflow(currentPlayback.streamflowStatus);
-    }
-  } else if (!wasStreamflowEnabled && settings.streamflowEnabled && currentPlayback) {
-    if (!currentPlayback.streamflow && currentPlayback.currentCandidate) {
-      prepareStreamflow(currentPlayback, currentPlayback.currentCandidate).then(streamflow => {
-        if (!currentPlayback) return;
-        currentPlayback.streamflow = streamflow;
-        currentPlayback.activePlayUrl = streamflow?.playUrl || currentPlayback.currentCandidate.url;
-        renderPlayerStreamflow(currentPlayback.streamflowStatus);
-        if (streamflow && currentPlayback.streamflowCanPrefetch) sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
-      });
-    } else {
-      renderPlayerStreamflow(currentPlayback.streamflowStatus);
-      if (currentPlayback.streamflowCanPrefetch) sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
-    }
-    if (els.player.paused) startPausedStreamflowPulse();
-  }
+  if (currentView === 'home') refreshPersonalizedHome({ preserveScroll: false });
 }));
-els.playerStreamflowClose?.addEventListener('click', event => {
-  event.stopPropagation();
-  setStreamflowPanelExpanded(false);
-});
-els.playerStreamflowChip?.addEventListener('click', event => {
-  event.stopPropagation();
-  setStreamflowPanelExpanded(true);
-  scheduleStreamflowPanelCollapse(10000);
-});
-els.streamflowRefresh.addEventListener('click', () => loadStreamflowStatus());
-els.streamflowClear.addEventListener('click', async () => {
-  if (!confirm('确定重置 CactusStreamflow 边缘缓存吗？旧缓存不会再被读取，并由 Cloudflare 自动淘汰。')) return;
-  els.streamflowClear.disabled = true;
-  els.streamflowStatus.textContent = '正在切换缓存代数…';
-  try {
-    const response = await fetch('/api/cache/clear', { method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json' } });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || '缓存重置失败');
-    streamflowGeneration = Number(payload.generation || Date.now());
-    renderStreamflowStatus({ ready: true, generation: streamflowGeneration });
-    toast('CactusStreamflow 边缘缓存已重置');
-  } catch (error) {
-    els.streamflowStatus.textContent = error.message || '缓存重置失败';
-  } finally {
-    els.streamflowClear.disabled = false;
-  }
-});
 
 els.subtitleSelect.addEventListener('change', async () => {
   try {
@@ -1853,7 +1479,6 @@ els.playerNext.addEventListener('click', () => playRelativeEpisode(1));
 els.playerSwitchSource.addEventListener('click', () => {
   if (!currentPlayback) return;
   const position = Number.isFinite(els.player.currentTime) ? els.player.currentTime : 0;
-  sendStreamflowHeartbeat('exit', true).catch(() => {});
   stopStream(els.player);
   attemptPlayback(position, { forceFailover: true, resetBudget: true, reason: new Error('手动切换线路') });
 });
@@ -1869,44 +1494,15 @@ els.player.addEventListener('timeupdate', () => {
     currentPlayback.lastSync = Date.now();
     saveHistory();
   }
-  if (Date.now() - Number(currentPlayback.lastStreamflowSync || 0) >= 20000) {
-    sendStreamflowHeartbeat('playing').catch(() => {});
-  }
   const remaining = Number(els.player.duration || 0) - Number(els.player.currentTime || 0);
   if (remaining > 0 && remaining < 90) prewarmNextEpisode();
 });
-els.player.addEventListener('loadedmetadata', () => { renderPlayerStreamflow(); });
-els.player.addEventListener('durationchange', () => {
-  if (!currentPlayback || !(Number.isFinite(els.player.duration) && els.player.duration > 0)) return;
-  renderPlayerStreamflow(currentPlayback.streamflowStatus);
-  if (currentPlayback.streamflowCanPrefetch) sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
-});
 els.player.addEventListener('seeked', () => {
   if (!currentPlayback || els.player.ended) return;
-  sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
-  if (els.player.paused) startPausedStreamflowPulse();
-});
-els.player.addEventListener('play', () => {
-  if (streamflowPulseTimer) clearInterval(streamflowPulseTimer);
-  streamflowPulseTimer = 0;
-  sendStreamflowHeartbeat('playing').catch(() => {});
-});
-els.player.addEventListener('pause', () => {
-  if (!currentPlayback || els.player.ended) return;
-  sendStreamflowHeartbeat('paused').catch(() => {});
-  startPausedStreamflowPulse();
-});
-els.player.addEventListener('cactus:streamflow', event => {
-  const playback = currentPlayback;
-  if (!playback) return;
-  const delivery = String(event.detail?.delivery || '').toUpperCase();
-  if (delivery === 'HIT') playback.streamflowMetrics.hits += 1;
-  if (delivery === 'MISS') playback.streamflowMetrics.misses += 1;
-  renderPlayerStreamflow(playback.streamflowStatus);
+  currentPlayback.lastPlaybackPressureAt = Date.now();
 });
 
 els.player.addEventListener('ended', () => {
-  sendStreamflowHeartbeat('exit', true).catch(() => {});
   saveHistory(els.player.duration || els.player.currentTime || 0, els.player.duration || 0);
   showNextEpisodePrompt();
 });
@@ -1914,21 +1510,24 @@ els.player.addEventListener('cactus:verified', event => {
   if (!currentPlayback?.currentCandidate) return;
   const startup = Number(event.detail?.startupMs || 0);
   currentPlayback.lastStartupMs = startup;
-  currentPlayback.streamflowCanPrefetch = true;
   setPlaybackStatus(`${currentPlayback.currentCandidate.providerName || currentPlayback.currentCandidate.provider} · ${currentPlayback.currentCandidate.lineName}${startup ? ` · 首帧 ${startup}ms` : ''}`, 'ready');
-  setTimeout(() => {
-    if (!currentPlayback?.streamflowCanPrefetch) return;
-    sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
-    if (els.player.paused) startPausedStreamflowPulse();
-  }, 1200);
 });
 els.player.addEventListener('cactus:stable', () => {
   const playback = currentPlayback;
   const candidate = playback?.currentCandidate;
-  if (!playback || !candidate || playback.successRecorded) return;
-  playback.successRecorded = true;
-  store.recordSourceSuccess(candidate.provider, candidateHealthKey(candidate));
-  prewarmNextEpisode();
+  if (!playback || !candidate) return;
+  if (!playback.successRecorded) {
+    playback.successRecorded = true;
+    store.recordSourceSuccess(candidate.provider, candidateHealthKey(candidate));
+    prewarmNextEpisode();
+  }
+});
+
+['waiting', 'stalled', 'seeking'].forEach(name => els.player.addEventListener(name, () => {
+  if (currentPlayback) currentPlayback.lastPlaybackPressureAt = Date.now();
+}));
+els.player.addEventListener('playing', () => {
+  if (currentPlayback && playerBufferAhead() >= 18) currentPlayback.lastPlaybackPressureAt = 0;
 });
 
 els.player.addEventListener('cactus:error', event => {
@@ -1941,27 +1540,22 @@ els.player.addEventListener('cactus:error', event => {
 });
 
 els.playerDialog.addEventListener('close', () => {
-  sendStreamflowHeartbeat('exit', true).catch(() => {});
   playbackSequence += 1;
   cancelNextEpisode();
   saveHistory();
   playerUI?.setRetry(null);
   stopStream(els.player);
-  clearStreamflowTimers();
-  els.playerStreamflow?.classList.add('hidden');
-  els.playerStreamflowChip?.classList.add('hidden');
-  clearStreamflowPanelTimer();
   currentPlayback = null;
   setPlaybackStatus('');
   if ('mediaSession' in navigator) {
     try { navigator.mediaSession.metadata = null; } catch {}
   }
+  idle(() => refreshPersonalizedHome(), 700);
 });
 
-window.addEventListener('pagehide', () => { sendStreamflowHeartbeat('exit', true).catch(() => {}); saveHistory(); store.flush(); });
+window.addEventListener('pagehide', () => { saveHistory(); store.flush(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { sendStreamflowHeartbeat('hidden', true).catch(() => {}); saveHistory(); store.flush(); }
-  else if (currentPlayback) sendStreamflowHeartbeat(els.player.paused ? 'paused' : 'playing').catch(() => {});
+  if (document.visibilityState === 'hidden') { saveHistory(); store.flush(); }
 });
 window.addEventListener('popstate', applyRoute);
 window.addEventListener('keydown', event => { if (event.key === 'Escape' && document.body.classList.contains('search-open')) closeSearch(); });
@@ -1988,8 +1582,6 @@ async function loadHealth() {
     els.brandName.textContent = brandBase.toUpperCase();
     els.footerName.textContent = siteName;
     document.title = siteName;
-    streamflowBackendReady = Boolean(health.streamflowReady);
-    streamflowGeneration = Number(health.streamflowGeneration || 1);
     if (health.tmdbReady) els.metadataCredit.innerHTML = '<a class="footer-link" href="https://www.themoviedb.org" target="_blank" rel="noreferrer">Metadata by TMDB</a>';
     else els.metadataCredit.textContent = '影片资料来自豆瓣';
     els.sourcePills.innerHTML = (health.providers || []).map(provider => `<span class="source-pill ${provider.proxyEnabled ? 'proxied' : ''}">${escapeHtml(provider.name)}</span>`).join('');
@@ -2002,6 +1594,11 @@ async function loadHealth() {
 (async function init() {
   renderHero(null);
   if (!history.state?.cactus) history.replaceState({ cactus: true, direct: true }, '', location.href);
-  await Promise.allSettled([store.ready(), loadHealth()]);
   await applyRoute();
+  idle(() => loadHealth().catch(() => {}), 900);
+  idle(() => {
+    store.ready()
+      .then(() => idle(() => refreshPersonalizedHome(), 700))
+      .catch(() => {});
+  }, 1200);
 })();

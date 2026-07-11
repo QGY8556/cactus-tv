@@ -221,6 +221,7 @@ function createSession(video, url, resumeAt) {
     recoveredPosition: false, ready: false, networkRecoveries: 0, mediaRecoveries: 0,
     stallSince: 0, stallRecoveries: 0, stallCount: 0, lastProgressAt: performance.now(),
     lastCurrentTime: 0, startedAt: performance.now(), firstFrameAt: 0, bandwidth: 0,
+    lastEmergencyDownshiftAt: 0, emergencyDownshifts: 0, bufferTarget: 0, cleanStreamRemoved: 0,
   };
   activeSession = session;
   return session;
@@ -276,6 +277,7 @@ function diagnostics(session) {
     resolution: video.videoWidth && video.videoHeight ? `${video.videoWidth}×${video.videoHeight}` : '—',
     bandwidth: Math.round(Number(session.bandwidth || session.hls?.bandwidthEstimate || 0)),
     buffer: Number(bufferAhead(video).toFixed(1)),
+    bufferTarget: Number(session.bufferTarget || 0),
     currentTime: Number((video.currentTime || 0).toFixed(1)),
     dropped, total,
     stalls: session.stallCount,
@@ -290,16 +292,44 @@ function failSession(session, error, recoverable = true) {
   emit(session.video, 'error', { error: error instanceof Error ? error : new Error(String(error)), recoverable });
 }
 
+function emergencyDownshift(session) {
+  const hls = session.hls;
+  if (!hls || !Array.isArray(hls.levels) || hls.levels.length < 2) return false;
+  const now = performance.now();
+  if (now - session.lastEmergencyDownshiftAt < 3500) return false;
+  const current = Number.isInteger(hls.currentLevel) && hls.currentLevel >= 0
+    ? hls.currentLevel
+    : Number.isInteger(hls.nextLoadLevel) && hls.nextLoadLevel >= 0
+      ? hls.nextLoadLevel
+      : hls.levels.length - 1;
+  const next = Math.max(0, current - 1);
+  if (next >= current) return false;
+  session.lastEmergencyDownshiftAt = now;
+  session.emergencyDownshifts += 1;
+  try {
+    hls.nextAutoLevel = next;
+    emit(session.video, 'qualityRecovery', { from: current, to: next, reason: 'buffer-starvation' });
+    return true;
+  } catch { return false; }
+}
+
 function recoverStall(session) {
   const { video } = session;
   session.stallRecoveries += 1;
   emit(video, 'state', { state: 'reconnecting', attempt: session.stallRecoveries });
   try {
     if (session.hls) {
-      if (session.stallRecoveries === 1 && bufferAhead(video) > 0.4) video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 0.12);
-      session.hls.startLoad(Math.max(0, video.currentTime - 0.25));
+      emergencyDownshift(session);
+      if (session.stallRecoveries === 1 && bufferAhead(video) > 0.35) {
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 0.1);
+      }
+      if (session.stallRecoveries >= 2) {
+        try { session.hls.recoverMediaError(); } catch {}
+      }
+      session.hls.startLoad(Math.max(0, video.currentTime - 0.2));
     } else if (session.dash) {
       const position = video.currentTime || 0;
+      try { session.dash.setQualityFor?.('video', Math.max(0, Number(session.dash.getQualityFor?.('video') || 0) - 1)); } catch {}
       session.dash.seek(position);
       session.dash.play();
     } else {
@@ -354,9 +384,9 @@ function bindStallMonitor(session) {
       return;
     }
     const stalledFor = now - session.stallSince;
-    if (stalledFor > 6500 && session.stallRecoveries < 2) recoverStall(session);
-    if (stalledFor > 15000) failSession(session, new Error('播放持续卡住，正在切换备用线路'));
-  }, 2000, true);
+    if (stalledFor > 4500 && session.stallRecoveries < 3) recoverStall(session);
+    if (stalledFor > 18000) failSession(session, new Error('播放持续卡住，正在切换备用线路'));
+  }, 3000, true);
 }
 
 function verifySession(session) {
@@ -443,14 +473,25 @@ async function playNative(session) {
 
 function deviceProfile() {
   const connection = navigator.connection || {};
+  const downlink = Number(connection.downlink || 0);
+  const memory = Number(navigator.deviceMemory || 8);
+  const cores = Number(navigator.hardwareConcurrency || 8);
   const slowNetwork = /(^|-)2g$|3g/i.test(connection.effectiveType || '')
-    || (Number(connection.downlink || 10) < 2)
+    || (downlink > 0 && downlink < 2)
     || (Number(connection.rtt || 0) > 450);
-  const constrained = Boolean(connection.saveData || slowNetwork
-    || (navigator.deviceMemory && navigator.deviceMemory <= 4)
-    || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4));
-  const mobile = matchMedia('(max-width: 800px)').matches;
-  return { constrained, mobile, slowNetwork, downlink: Number(connection.downlink || 0) };
+  const lowMemory = memory <= 2;
+  const lowCpu = cores <= 2;
+  const constrained = Boolean(connection.saveData || /(^|-)2g$/i.test(connection.effectiveType || '') || (lowMemory && lowCpu));
+  const mobile = matchMedia('(max-width: 900px)').matches || matchMedia('(pointer: coarse)').matches;
+  const targetBuffer = constrained ? 90 : mobile ? 200 : 300;
+  const maxBuffer = constrained ? 140 : mobile ? 300 : 450;
+  const backBuffer = constrained ? 36 : mobile ? 100 : 160;
+  const maxBufferBytes = constrained
+    ? 128 * 1024 * 1024
+    : mobile
+      ? (memory >= 8 ? 384 : 256) * 1024 * 1024
+      : (memory >= 8 ? 768 : 512) * 1024 * 1024;
+  return { constrained, mobile, slowNetwork, downlink, lowMemory, lowCpu, memory, cores, targetBuffer, maxBuffer, backBuffer, maxBufferBytes };
 }
 
 function levelPayload(hls) {
@@ -474,21 +515,55 @@ async function playWithHls(session) {
   const Hls = await loadHls();
   if (session.cleaned || session.generation !== playbackGeneration) throw new DOMException('播放已取消', 'AbortError');
   if (!Hls.isSupported()) throw new Error('当前浏览器不支持 HLS 播放');
-  const { constrained, mobile, slowNetwork, downlink } = deviceProfile();
+  const profile = deviceProfile();
+  const { constrained, mobile, slowNetwork, downlink } = profile;
+  const proxied = isSameOriginProxy(session.url);
+  const defaultEstimate = downlink
+    ? Math.max(900000, Math.min(12_000_000, downlink * 850000))
+    : mobile ? 2_800_000 : 4_500_000;
+  session.bufferTarget = profile.targetBuffer;
   const hls = new Hls({
-    enableWorker: true, lowLatencyMode: false, capLevelToPlayerSize: true,
-    startLevel: slowNetwork ? 0 : -1, startFragPrefetch: true, testBandwidth: true,
-    abrEwmaDefaultEstimate: downlink ? Math.max(350000, downlink * 750000) : 1000000,
-    abrBandWidthFactor: slowNetwork ? 0.75 : 0.85, abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.7,
-    maxStarvationDelay: slowNetwork ? 2 : 4, maxLoadingDelay: slowNetwork ? 2 : 4,
-    backBufferLength: constrained ? 8 : 24,
-    maxBufferLength: constrained ? 14 : mobile ? 24 : 38,
-    maxMaxBufferLength: constrained ? 26 : mobile ? 46 : 70,
-    maxBufferSize: constrained ? 18 * 1024 * 1024 : mobile ? 38 * 1024 * 1024 : 56 * 1024 * 1024,
-    maxBufferHole: 0.5, highBufferWatchdogPeriod: 2, nudgeOffset: 0.1, nudgeMaxRetry: 5,
-    manifestLoadingTimeOut: 9000, manifestLoadingMaxRetry: 2,
-    levelLoadingTimeOut: 10000, levelLoadingMaxRetry: 3,
-    fragLoadingTimeOut: 14000, fragLoadingMaxRetry: 3, appendErrorMaxRetry: 3,
+    enableWorker: true,
+    lowLatencyMode: false,
+    capLevelToPlayerSize: true,
+    capLevelOnFPSDrop: true,
+    fpsDroppedMonitoringPeriod: 5000,
+    fpsDroppedMonitoringThreshold: 0.18,
+    startLevel: slowNetwork ? 0 : -1,
+    startFragPrefetch: true,
+    testBandwidth: true,
+    abrEwmaDefaultEstimate: defaultEstimate,
+    abrEwmaFastVoD: 2,
+    abrEwmaSlowVoD: 7,
+    abrMaxWithRealBitrate: true,
+    abrBandWidthFactor: slowNetwork ? 0.72 : 0.88,
+    abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.76,
+    maxStarvationDelay: slowNetwork ? 2 : 3.5,
+    maxLoadingDelay: slowNetwork ? 2.5 : 5,
+    // Pure Player: keep a deep local buffer so playback can ride through slow or unstable sources.
+    // Mobile/tablet targets ~200s; wider desktop layouts target ~300s.
+    backBufferLength: profile.backBuffer,
+    maxBufferLength: profile.targetBuffer,
+    maxMaxBufferLength: profile.maxBuffer,
+    maxBufferSize: profile.maxBufferBytes,
+    maxBufferHole: 0.3,
+    maxFragLookUpTolerance: 0.2,
+    progressive: true,
+    enableSoftwareAES: true,
+    highBufferWatchdogPeriod: 3,
+    nudgeOffset: 0.08,
+    nudgeMaxRetry: 4,
+    manifestLoadingTimeOut: 10000,
+    manifestLoadingMaxRetry: 2,
+    manifestLoadingRetryDelay: 500,
+    levelLoadingTimeOut: 12000,
+    levelLoadingMaxRetry: 3,
+    levelLoadingRetryDelay: 500,
+    fragLoadingTimeOut: proxied ? 12000 : 20000,
+    fragLoadingMaxRetry: proxied ? 2 : 4,
+    fragLoadingRetryDelay: 600,
+    fragLoadingMaxRetryTimeout: 5000,
+    appendErrorMaxRetry: 3,
   });
   session.hls = hls;
   session.engine = 'hls.js';
@@ -507,8 +582,22 @@ async function playWithHls(session) {
       const error = new Error(`播放失败：${data.details || data.type || '未知错误'}`);
       if (!session.verified) finish(error); else failSession(session, error, false);
     };
-    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), 16000);
+    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), proxied ? 15000 : 22000);
     hls.on(Hls.Events.MEDIA_ATTACHED, () => { if (!session.cleaned) hls.loadSource(session.url); });
+    hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+      try {
+        const details = data?.networkDetails;
+        const getHeader = name => {
+          if (details?.headers?.get) return details.headers.get(name);
+          if (typeof details?.getResponseHeader === 'function') return details.getResponseHeader(name);
+          return null;
+        };
+        const mode = String(getHeader('x-cactus-cleanstream') || '').toUpperCase();
+        const removed = Number(getHeader('x-cactus-cleanstream-removed') || 0);
+        session.cleanStreamRemoved = Number.isFinite(removed) ? removed : 0;
+        if (mode) emit(session.video, 'cleanstream', { mode, removed: session.cleanStreamRemoved });
+      } catch {}
+    });
     hls.on(Hls.Events.MANIFEST_PARSED, async () => {
       manifestReady = true;
       emit(session.video, 'levels', levelPayload(hls));
@@ -516,7 +605,7 @@ async function playWithHls(session) {
       applyResume(session);
       try {
         session.autoplayBlocked = !(await safePlay(session.video));
-        await waitForFirstFrame(session, 13000);
+        await waitForFirstFrame(session, proxied ? 13000 : 18000);
         finish();
       } catch (error) { finish(error); }
     });
@@ -538,6 +627,7 @@ async function playWithHls(session) {
       if (!data.fatal || session.cleaned) return;
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR && session.networkRecoveries < 3) {
         const attempt = ++session.networkRecoveries;
+        emergencyDownshift(session);
         emit(session.video, 'state', { state: 'reconnecting', attempt });
         addTimer(session, () => { try { hls.startLoad(Math.max(0, session.video.currentTime || -1)); } catch { fatal(data); } }, Math.min(500 * (2 ** (attempt - 1)), 2500));
         return;
@@ -590,10 +680,23 @@ async function playWithDash(session) {
   session.engine = 'dash.js';
   emit(session.video, 'engine', { engine: 'dash.js' });
   const profile = deviceProfile();
+  session.bufferTarget = profile.targetBuffer;
   player.updateSettings({ streaming: {
-    abr: { autoSwitchBitrate: { video: true, audio: true }, initialBitrate: { video: profile.slowNetwork ? 350 : -1 } },
-    buffer: { bufferTimeAtTopQuality: profile.constrained ? 12 : 24, bufferTimeAtTopQualityLongForm: profile.constrained ? 18 : 36, bufferToKeep: profile.constrained ? 8 : 20 },
-    retryAttempts: { MPD: 2, MediaSegment: 3, InitializationSegment: 3 },
+    abr: {
+      autoSwitchBitrate: { video: true, audio: true },
+      initialBitrate: { video: profile.slowNetwork ? 350 : -1 },
+      limitBitrateByPortal: true,
+      useDeadTimeLatency: true,
+    },
+    buffer: {
+      bufferTimeDefault: profile.constrained ? 60 : profile.targetBuffer,
+      bufferTimeAtTopQuality: profile.constrained ? 90 : profile.targetBuffer,
+      bufferTimeAtTopQualityLongForm: profile.constrained ? 120 : profile.maxBuffer,
+      bufferToKeep: profile.backBuffer,
+      fastSwitchEnabled: true,
+    },
+    retryAttempts: { MPD: 2, MediaSegment: 4, InitializationSegment: 3 },
+    retryIntervals: { MPD: 500, MediaSegment: 500, InitializationSegment: 500 },
   }});
   await new Promise((resolve, reject) => {
     let settled = false;

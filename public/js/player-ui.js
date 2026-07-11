@@ -73,13 +73,25 @@ export function createPlayerUI({
   let diagnosticsVisible = false;
   let diagnosticsData = null;
   let locked = false;
-  let brightness = 1;
+  let brightness = (() => { try { return clamp(Number(localStorage.getItem('cactus:player-brightness') || 1), .2, 1); } catch { return 1; } })();
   let pointerSession = null;
   let suppressClickUntil = 0;
+  let gestureFrame = 0;
+  let pendingGestureUpdate = null;
+  let singleTapTimer = 0;
+  let lastTapTime = 0;
+  let lastTapZone = '';
+  let lastDoubleTapAt = 0;
+  let lastDoubleTapZone = '';
+  let doubleTapSeekTotal = 0;
+  let doubleTapResetTimer = 0;
   const coarsePointer = matchMedia('(pointer: coarse)');
   const finePointer = matchMedia('(hover: hover) and (pointer: fine)');
-  const LONG_PRESS_MS = 430;
-  const GESTURE_THRESHOLD = 12;
+  const LONG_PRESS_MS = 420;
+  const GESTURE_THRESHOLD = 16;
+  const AXIS_LOCK_RATIO = 1.38;
+  const DOUBLE_TAP_MS = 270;
+  const persistPlayerPreference = (key, value) => { try { localStorage.setItem(key, String(value)); } catch {} };
 
   const setIcon = (button, icon) => { if (button) button.innerHTML = svgIcon(icon); };
 
@@ -97,7 +109,8 @@ export function createPlayerUI({
 
   function scheduleHide(delay = 2800) {
     clearTimeout(hideTimer);
-    if (!locked && (video.paused || state !== 'playing')) return;
+    if (dialog.classList.contains('tools-open')) return;
+    if (['loading', 'buffering', 'reconnecting', 'recovering', 'error'].includes(state)) return;
     hideTimer = window.setTimeout(() => {
       closeTools();
       setControlsVisible(false);
@@ -132,7 +145,8 @@ export function createPlayerUI({
     shell.classList.toggle('is-playing', activePlayback);
     if (nextState === 'playing') {
       if (!locked && shell.classList.contains('controls-visible')) scheduleHide();
-    } else if (nextState === 'paused' || nextState === 'ended') showControls(true);
+    } else if (nextState === 'paused') showControls();
+    else if (nextState === 'ended') showControls(true);
     else if (nextState === 'loading' && !video.currentTime) showControls(true);
   }
 
@@ -174,22 +188,41 @@ export function createPlayerUI({
     showControls();
   }
 
-  function showGesture(text, duration = 650) {
-    ui.gesture.textContent = text;
+  function showGesture(content, duration = 650) {
+    if (typeof content === 'string') {
+      ui.gesture.textContent = content;
+    } else {
+      const label = String(content?.label || '');
+      const detail = String(content?.detail || '');
+      const progress = Number(content?.progress);
+      ui.gesture.innerHTML = `<strong>${label}</strong>${detail ? `<small>${detail}</small>` : ''}${Number.isFinite(progress) ? `<span class="player-gesture-meter"><i style="width:${clamp(progress, 0, 1) * 100}%"></i></span>` : ''}`;
+    }
     ui.gesture.classList.remove('hidden');
     clearTimeout(gestureTimer);
     if (duration > 0) gestureTimer = window.setTimeout(() => ui.gesture.classList.add('hidden'), duration);
   }
 
-  function applyBrightness(value) {
+  function showTapRipple(x, y, direction) {
+    const ripple = document.createElement('span');
+    ripple.className = `player-tap-ripple player-tap-ripple-${direction}`;
+    ripple.style.left = `${x}px`;
+    ripple.style.top = `${y}px`;
+    ripple.textContent = direction === 'left' ? '−10' : direction === 'right' ? '+10' : '⏯';
+    shell.appendChild(ripple);
+    ripple.addEventListener('animationend', () => ripple.remove(), { once: true });
+    window.setTimeout(() => ripple.remove(), 850);
+  }
+
+  function applyBrightness(value, persist = false) {
     brightness = clamp(value, 0.2, 1);
     if (ui.brightnessShade) ui.brightnessShade.style.opacity = String((1 - brightness) * 0.82);
+    if (persist) persistPlayerPreference('cactus:player-brightness', brightness.toFixed(3));
   }
 
   function seekBy(seconds) {
     if (!Number.isFinite(video.duration)) return;
     video.currentTime = clamp(video.currentTime + seconds, 0, video.duration);
-    showGesture(seconds > 0 ? `快进 ${seconds} 秒` : `快退 ${Math.abs(seconds)} 秒`, 700);
+    showGesture({ label: seconds > 0 ? `快进 ${seconds} 秒` : `快退 ${Math.abs(seconds)} 秒`, detail: formatClock(video.currentTime) }, 700);
     showControls();
   }
 
@@ -276,7 +309,7 @@ export function createPlayerUI({
       `状态  ${d.state || '—'}`,
       `画面  ${d.resolution || '—'}`,
       `带宽  ${mbps}`,
-      `缓冲  ${d.buffer ?? 0}s`,
+      `缓冲  ${d.buffer ?? 0}s / 目标 ${d.bufferTarget || '—'}s`,
       `首帧  ${d.startupMs ? `${d.startupMs}ms` : '—'}`,
       `丢帧  ${dropped}`,
       `卡顿  ${d.stalls || 0}`,
@@ -328,25 +361,42 @@ export function createPlayerUI({
     longPressTimer = 0;
   }
 
+  function queueGestureUpdate(callback) {
+    pendingGestureUpdate = callback;
+    if (gestureFrame) return;
+    gestureFrame = requestAnimationFrame(() => {
+      gestureFrame = 0;
+      const update = pendingGestureUpdate;
+      pendingGestureUpdate = null;
+      update?.();
+    });
+  }
+
   function finishPointerGesture(event) {
     const session = pointerSession;
     if (!session || (event && event.pointerId !== session.id)) return;
     clearLongPress();
     if (session.mode === 'boost') {
       video.playbackRate = session.previousRate;
-      showGesture(`恢复 ${session.previousRate}×`, 450);
-      suppressClickUntil = performance.now() + 500;
+      showGesture({ label: `恢复 ${session.previousRate}×`, detail: '长按倍速结束' }, 420);
+      suppressClickUntil = performance.now() + 450;
+    } else if (session.mode === 'seek') {
+      if (Number.isFinite(session.previewTime)) video.currentTime = session.previewTime;
+      showGesture({ label: '已定位', detail: `${formatClock(session.previewTime || 0)} / ${formatClock(video.duration || 0)}`, progress: (session.previewTime || 0) / Math.max(1, video.duration || 1) }, 520);
+      suppressClickUntil = performance.now() + 450;
     } else if (session.mode === 'brightness' || session.mode === 'volume') {
+      if (session.mode === 'brightness') applyBrightness(brightness, true);
+      else persistPlayerPreference('cactus:player-volume', video.volume.toFixed(3));
       clearTimeout(gestureTimer);
-      gestureTimer = window.setTimeout(() => ui.gesture.classList.add('hidden'), 420);
-      suppressClickUntil = performance.now() + 500;
+      gestureTimer = window.setTimeout(() => ui.gesture.classList.add('hidden'), 360);
+      suppressClickUntil = performance.now() + 450;
     }
     pointerSession = null;
     try { video.releasePointerCapture?.(session.id); } catch {}
   }
 
   function beginPointerGesture(event) {
-    if (!coarsePointer.matches || event.pointerType === 'mouse' || event.isPrimary === false || event.button !== 0) return;
+    if (!coarsePointer.matches || event.pointerType === 'mouse' || event.isPrimary === false || event.button !== 0 || locked) return;
     const bounds = video.getBoundingClientRect();
     pointerSession = {
       id: event.pointerId,
@@ -354,7 +404,11 @@ export function createPlayerUI({
       startY: event.clientY,
       startVolume: video.muted ? 0 : video.volume,
       startBrightness: brightness,
+      startTime: Number(video.currentTime || 0),
+      previewTime: Number(video.currentTime || 0),
       previousRate: video.playbackRate,
+      startedAt: performance.now(),
+      startRatio: (event.clientX - bounds.left) / Math.max(1, bounds.width),
       side: event.clientX < bounds.left + bounds.width / 2 ? 'left' : 'right',
       mode: 'pending',
       bounds,
@@ -362,14 +416,16 @@ export function createPlayerUI({
     try { video.setPointerCapture?.(event.pointerId); } catch {}
     clearLongPress();
     longPressTimer = window.setTimeout(() => {
-      if (!pointerSession || pointerSession.id !== event.pointerId || pointerSession.mode !== 'pending' || locked || video.paused) return;
+      if (!pointerSession || pointerSession.id !== event.pointerId || pointerSession.mode !== 'pending' || video.paused) return;
+      if (Math.abs(pointerSession.startRatio - 0.5) > 0.46) return;
       pointerSession.mode = 'boost';
       pointerSession.previousRate = video.playbackRate;
       video.playbackRate = 2;
+      navigator.vibrate?.(10);
       closeTools();
       hideControls();
-      showGesture('2× 快进', 0);
-      suppressClickUntil = performance.now() + 500;
+      showGesture({ label: '2× 倍速播放', detail: '松手恢复原速度', progress: 1 }, 0);
+      suppressClickUntil = performance.now() + 450;
     }, LONG_PRESS_MS);
   }
 
@@ -381,25 +437,51 @@ export function createPlayerUI({
     const distance = Math.hypot(dx, dy);
     if (session.mode === 'pending' && distance >= GESTURE_THRESHOLD) {
       clearLongPress();
-      if (Math.abs(dy) > Math.abs(dx) * 1.08) {
-        session.mode = session.side === 'left' ? 'brightness' : 'volume';
-        closeTools();
-        hideControls();
-        suppressClickUntil = performance.now() + 500;
-      } else session.mode = 'ignored';
+      const horizontal = Math.abs(dx) > Math.abs(dy) * AXIS_LOCK_RATIO;
+      const vertical = Math.abs(dy) > Math.abs(dx) * AXIS_LOCK_RATIO;
+      const inVerticalEdge = session.startRatio <= 0.38 || session.startRatio >= 0.62;
+      if (vertical && inVerticalEdge) session.mode = session.side === 'left' ? 'brightness' : 'volume';
+      else if (horizontal) session.mode = 'seek';
+      else return;
+      closeTools();
+      hideControls();
+      suppressClickUntil = performance.now() + 450;
     }
     if (session.mode === 'brightness') {
       event.preventDefault();
-      const next = session.startBrightness - dy / Math.max(180, session.bounds.height) * 1.05;
-      applyBrightness(next);
-      showGesture(`亮度 ${Math.round(brightness * 100)}%`, 0);
+      const next = session.startBrightness - dy / Math.max(220, session.bounds.height * 0.78);
+      queueGestureUpdate(() => {
+        applyBrightness(next);
+        showGesture({ label: `亮度 ${Math.round(brightness * 100)}%`, progress: brightness }, 0);
+      });
     } else if (session.mode === 'volume') {
       event.preventDefault();
-      const next = clamp(session.startVolume - dy / Math.max(180, session.bounds.height) * 1.05, 0, 1);
-      video.volume = next;
-      video.muted = next === 0;
-      updateVolume();
-      showGesture(`音量 ${Math.round(next * 100)}%`, 0);
+      const next = clamp(session.startVolume - dy / Math.max(220, session.bounds.height * 0.78), 0, 1);
+      queueGestureUpdate(() => {
+        video.volume = next;
+        video.muted = next === 0;
+        updateVolume();
+        showGesture({ label: `音量 ${Math.round(next * 100)}%`, progress: next }, 0);
+      });
+    } else if (session.mode === 'seek') {
+      event.preventDefault();
+      const duration = Number(video.duration || 0);
+      const normalized = clamp(Math.abs(dx) / Math.max(260, session.bounds.width), 0, 1);
+      const elapsed = Math.max(0.08, (performance.now() - session.startedAt) / 1000);
+      const velocityBoost = clamp((Math.abs(dx) / elapsed) / 900, 1, 1.8);
+      const precision = Math.abs(dy) > session.bounds.height * .22 ? .18 : Math.abs(dy) > session.bounds.height * .1 ? .42 : 1;
+      const sweep = clamp(duration * 0.12, 150, 900);
+      const delta = Math.sign(dx) * (normalized ** 1.18) * sweep * velocityBoost * precision;
+      const preview = clamp(session.startTime + delta, 0, duration || session.startTime + Math.abs(delta));
+      session.previewTime = preview;
+      queueGestureUpdate(() => {
+        const signed = Math.round(preview - session.startTime);
+        showGesture({
+          label: `${signed >= 0 ? '快进' : '快退'} ${Math.abs(signed)} 秒`,
+          detail: `${precision < 1 ? '精细定位 · ' : ''}${formatClock(preview)} / ${formatClock(duration)}`,
+          progress: duration ? preview / duration : 0,
+        }, 0);
+      });
     }
   }
 
@@ -417,8 +499,49 @@ export function createPlayerUI({
       event.stopPropagation();
       return;
     }
-    if (coarsePointer.matches) showControls();
-    else if (!locked) togglePlay();
+    if (!coarsePointer.matches) {
+      if (!locked) togglePlay();
+      return;
+    }
+    if (locked) {
+      showControls();
+      return;
+    }
+    const bounds = video.getBoundingClientRect();
+    const ratio = (event.clientX - bounds.left) / Math.max(1, bounds.width);
+    const zone = ratio < 0.34 ? 'left' : ratio > 0.66 ? 'right' : 'center';
+    const now = performance.now();
+    if (now - lastTapTime <= DOUBLE_TAP_MS && zone === lastTapZone) {
+      clearTimeout(singleTapTimer);
+      singleTapTimer = 0;
+      lastTapTime = 0;
+      lastTapZone = '';
+      navigator.vibrate?.(8);
+      showTapRipple(event.clientX - bounds.left, event.clientY - bounds.top, zone);
+      if (zone === 'center') {
+        doubleTapSeekTotal = 0;
+        togglePlay();
+      } else {
+        if (now - lastDoubleTapAt <= 760 && zone === lastDoubleTapZone) doubleTapSeekTotal += zone === 'left' ? -10 : 10;
+        else doubleTapSeekTotal = zone === 'left' ? -10 : 10;
+        lastDoubleTapAt = now;
+        lastDoubleTapZone = zone;
+        clearTimeout(doubleTapResetTimer);
+        doubleTapResetTimer = window.setTimeout(() => { doubleTapSeekTotal = 0; lastDoubleTapZone = ''; }, 820);
+        if (Number.isFinite(video.duration)) video.currentTime = clamp(video.currentTime + (zone === 'left' ? -10 : 10), 0, video.duration);
+        showGesture({ label: doubleTapSeekTotal > 0 ? `快进 ${doubleTapSeekTotal} 秒` : `快退 ${Math.abs(doubleTapSeekTotal)} 秒`, detail: formatClock(video.currentTime) }, 620);
+        showControls();
+      }
+      return;
+    }
+    lastTapTime = now;
+    lastTapZone = zone;
+    clearTimeout(singleTapTimer);
+    singleTapTimer = window.setTimeout(() => {
+      singleTapTimer = 0;
+      if (shell.classList.contains('controls-visible')) hideControls();
+      else showControls();
+    }, DOUBLE_TAP_MS);
   });
   video.addEventListener('dblclick', event => {
     if (locked || coarsePointer.matches) return;
@@ -449,6 +572,7 @@ export function createPlayerUI({
     video.volume = Number(ui.volume.value);
     video.muted = video.volume === 0;
     updateVolume();
+    persistPlayerPreference('cactus:player-volume', video.volume.toFixed(3));
   });
   ui.speed.addEventListener('change', () => { video.playbackRate = Number(ui.speed.value) || 1; showControls(); });
   ui.quality.addEventListener('change', () => { setQuality(Number(ui.quality.value)); showControls(); });
@@ -602,6 +726,12 @@ export function createPlayerUI({
     ui.embeddedSubtitle.value = String(event.detail.current ?? -1);
   });
   video.addEventListener('cactus:diagnostics', event => { diagnosticsData = event.detail; if (diagnosticsVisible) renderDiagnostics(); });
+  video.addEventListener('cactus:cleanstream', event => {
+    const removed = Number(event.detail?.removed || 0);
+    if (event.detail?.mode === 'FILTERED' && removed > 0) {
+      showGesture({ label: `已跳过 ${removed} 个广告分片`, detail: 'Cactus Clean Stream' }, 1600);
+    }
+  });
   video.addEventListener('cactus:error', event => {
     setState('error');
     message.querySelector('span').textContent = event.detail.error?.message || '播放失败';
@@ -617,21 +747,27 @@ export function createPlayerUI({
   setIcon(ui.lock, 'unlock');
   setIcon(ui.tools, 'sliders');
   setIcon(ui.diagnostics, 'info');
+  try {
+    const savedVolume = Number(localStorage.getItem('cactus:player-volume'));
+    if (Number.isFinite(savedVolume)) video.volume = clamp(savedVolume, 0, 1);
+  } catch {}
+  applyBrightness(brightness);
   updateVolume();
   updateTime();
   showControls(true);
 
   return {
     reset() {
-      clearTimeout(hideTimer); clearTimeout(gestureTimer); clearLongPress();
+      clearTimeout(hideTimer); clearTimeout(gestureTimer); clearTimeout(singleTapTimer); clearTimeout(doubleTapResetTimer); clearLongPress();
       pointerSession = null; suppressClickUntil = 0;
       if (timeFrame) cancelAnimationFrame(timeFrame);
-      timeFrame = 0; diagnosticsData = null; diagnosticsVisible = false;
+      if (gestureFrame) cancelAnimationFrame(gestureFrame);
+      timeFrame = 0; gestureFrame = 0; pendingGestureUpdate = null; lastTapTime = 0; lastTapZone = ''; lastDoubleTapAt = 0; lastDoubleTapZone = ''; doubleTapSeekTotal = 0; diagnosticsData = null; diagnosticsVisible = false;
       setLocked(false);
       closeTools();
       message.classList.add('hidden');
       ui.gesture.classList.add('hidden');
-      applyBrightness(1);
+      applyBrightness(brightness);
       ui.diagnosticsPanel?.classList.add('hidden');
       ui.diagnostics?.classList.remove('active');
       ui.quality.innerHTML = '<option value="-1">自动</option>';
