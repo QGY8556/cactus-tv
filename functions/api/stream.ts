@@ -58,6 +58,12 @@ function rewriteMediaSequence(lines: string[], leadingRemoved: number): string[]
 function cleanHlsPlaylist(text: string): { text: string; removed: number; applied: boolean; reason: string } {
   if (!/#EXTINF:/i.test(text)) return { text, removed: 0, applied: false, reason: 'master-playlist' };
   if (hasImplicitAesIv(text)) return { text, removed: 0, applied: false, reason: 'implicit-aes-iv' };
+  // Segment deletion is unsafe when the source already carries explicit timeline
+  // boundaries or byte-range/fMP4 state. Removing one of those boundaries can
+  // expose the MPEG-TS 33-bit timestamp wrap (~26.5h) to MSE and corrupt seeking.
+  if (/#EXT-X-(?:DISCONTINUITY(?:-SEQUENCE)?|MAP|BYTERANGE|PROGRAM-DATE-TIME)\b/i.test(text)) {
+    return { text, removed: 0, applied: false, reason: 'timeline-sensitive' };
+  }
 
   const lines = text.split(/\r?\n/);
   const output: string[] = [];
@@ -115,7 +121,7 @@ function cleanHlsPlaylist(text: string): { text: string; removed: number; applie
 
       totalSegments += 1;
       const metadata = pending.join('\n');
-      const adByKeyword = STRONG_AD_TOKEN.test(line) || AD_TEXT_TOKEN.test(metadata);
+      const adByKeyword = STRONG_AD_TOKEN.test(line);
       const shouldRemove = cueActive || adByKeyword;
 
       if (shouldRemove) {
@@ -194,7 +200,7 @@ async function fetchRedirectSafe(provider: Provider, url: URL, request: Request)
   let current = url;
   for (let i = 0; i < 4; i += 1) {
     assertMediaUrl(provider, current.toString());
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/1.1.0', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/1.2.8', ...provider.requestHeaders });
     const range = request.headers.get('range');
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 15_000);
@@ -331,7 +337,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     return new Response(rewritten.text, {
       headers: {
         'content-type': 'application/vnd.apple.mpegurl; charset=utf-8',
-        'cache-control': 'private, max-age=10, stale-while-revalidate=20',
+        'cache-control': 'no-store, private',
         'access-control-allow-origin': '*',
         'x-cactus-media-kind': 'hls',
         'x-cactus-cleanstream': clean ? (rewritten.removed ? 'FILTERED' : 'PASS') : 'OFF',
@@ -356,7 +362,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     return new Response(normalizeMpdBase(text, finalUrl), {
       headers: {
         'content-type': 'application/dash+xml; charset=utf-8',
-        'cache-control': 'private, max-age=10, stale-while-revalidate=20',
+        'cache-control': 'no-store, private',
         'access-control-allow-origin': '*',
         'x-cactus-media-kind': 'dash',
       },
