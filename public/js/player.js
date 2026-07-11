@@ -593,28 +593,6 @@ function emitHlsTracks(session, Hls) {
   emit(session.video, 'subtitleTracks', { tracks: subtitles, current: Number(hls.subtitleTrack ?? -1) });
 }
 
-function scheduleBufferRamp(session, engine, profile, applyTarget) {
-  const stages = [
-    { delay: 6500, target: profile.midBuffer },
-    { delay: 18000, target: profile.targetBuffer },
-  ];
-  const tryApply = (stage, retries = 0) => {
-    if (session.cleaned || session.failed || session.generation !== playbackGeneration) return;
-    if (document.hidden || !navigator.onLine || session.stallSince || session.video.seeking) {
-      if (retries < 6) addTimer(session, () => tryApply(stage, retries + 1), 4000);
-      return;
-    }
-    try {
-      applyTarget(stage.target);
-      session.bufferRampStage += 1;
-      session.bufferTarget = stage.target;
-      emit(session.video, 'bufferTarget', { engine, target: stage.target });
-      diagnostics(session);
-    } catch {}
-  };
-  stages.forEach(stage => addTimer(session, () => tryApply(stage), stage.delay));
-}
-
 async function playWithHls(session) {
   const Hls = await loadHls();
   if (session.cleaned || session.generation !== playbackGeneration) throw new DOMException('播放已取消', 'AbortError');
@@ -622,10 +600,12 @@ async function playWithHls(session) {
   const profile = deviceProfile();
   const { constrained, mobile, slowNetwork, downlink } = profile;
   const proxied = isSameOriginProxy(session.url);
-  const defaultEstimate = downlink
-    ? Math.max(900000, Math.min(12_000_000, downlink * 850000))
-    : mobile ? 2_800_000 : 4_500_000;
-  session.bufferTarget = profile.startupBuffer;
+  // The Network Information API is intentionally coarse and often reports only 2–4 Mbps
+  // even on much faster Wi-Fi. Use it only as a floor signal, never as a hard startup ceiling.
+  const reportedEstimate = downlink > 0 ? downlink * 1_000_000 : 0;
+  const baselineEstimate = slowNetwork ? 1_500_000 : mobile ? 10_000_000 : 20_000_000;
+  const defaultEstimate = Math.max(baselineEstimate, Math.min(100_000_000, reportedEstimate));
+  session.bufferTarget = profile.targetBuffer;
   const hls = new Hls({
     enableWorker: true,
     lowLatencyMode: false,
@@ -637,16 +617,17 @@ async function playWithHls(session) {
     startFragPrefetch: true,
     testBandwidth: true,
     abrEwmaDefaultEstimate: defaultEstimate,
-    abrEwmaFastVoD: 2,
-    abrEwmaSlowVoD: 7,
+    abrEwmaFastVoD: 1.5,
+    abrEwmaSlowVoD: 5,
     abrMaxWithRealBitrate: true,
-    abrBandWidthFactor: slowNetwork ? 0.72 : 0.88,
-    abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.76,
+    abrBandWidthFactor: slowNetwork ? 0.72 : 0.92,
+    abrBandWidthUpFactor: slowNetwork ? 0.55 : 0.85,
     maxStarvationDelay: slowNetwork ? 2 : 3.5,
     maxLoadingDelay: slowNetwork ? 2.5 : 5,
-    // Start conservatively for the first frame, then ramp to 200s/300s.
+    // Fill the requested local buffer immediately. hls.js still downloads sequentially and
+    // respects the byte cap, so this restores throughput without creating parallel fetch storms.
     backBufferLength: profile.backBuffer,
-    maxBufferLength: profile.startupBuffer,
+    maxBufferLength: profile.targetBuffer,
     maxMaxBufferLength: profile.maxBuffer,
     maxBufferSize: profile.maxBufferBytes,
     maxBufferHole: 0.3,
@@ -663,7 +644,7 @@ async function playWithHls(session) {
     levelLoadingMaxRetry: 3,
     levelLoadingRetryDelay: 500,
     fragLoadingTimeOut: proxied ? 12000 : 20000,
-    fragLoadingMaxRetry: proxied ? 1 : 3,
+    fragLoadingMaxRetry: proxied ? 2 : 4,
     fragLoadingRetryDelay: 600,
     fragLoadingMaxRetryTimeout: 5000,
     appendErrorMaxRetry: 3,
@@ -685,7 +666,7 @@ async function playWithHls(session) {
       const error = new Error(`播放失败：${data.details || data.type || '未知错误'}`);
       if (!session.verified) finish(error); else failSession(session, error, false);
     };
-    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), proxied ? 13000 : 20000);
+    const startupTimer = addTimer(session, () => finish(new Error(manifestReady ? '首个视频分片加载超时' : '播放列表加载超时')), proxied ? 15000 : 22000);
     hls.on(Hls.Events.MEDIA_ATTACHED, () => { if (!session.cleaned) hls.loadSource(session.url); });
     hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
       try {
@@ -708,18 +689,23 @@ async function playWithHls(session) {
       applyResume(session);
       try {
         session.autoplayBlocked = !(await safePlay(session.video));
-        await waitForFirstFrame(session, proxied ? 12000 : 17000);
-        scheduleBufferRamp(session, 'hls.js', profile, target => {
-          hls.config.maxBufferLength = target;
-        });
+        await waitForFirstFrame(session, proxied ? 13000 : 18000);
         finish();
       } catch (error) { finish(error); }
     });
     hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => emit(session.video, 'quality', { currentLevel: Number(data.level ?? -1), auto: hls.autoLevelEnabled }));
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
       const loaded = Number(data?.stats?.loaded || 0);
-      const durationMs = Math.max(1, Number(data?.stats?.loading?.end || 0) - Number(data?.stats?.loading?.start || 0));
-      if (loaded) session.bandwidth = Math.round((loaded * 8 * 1000) / durationMs);
+      const loading = data?.stats?.loading || {};
+      const transferStart = Number(loading.first || loading.start || 0);
+      const transferEnd = Number(loading.end || 0);
+      const durationMs = Math.max(1, transferEnd - transferStart);
+      if (loaded && transferEnd > transferStart) {
+        const measured = Math.round((loaded * 8 * 1000) / durationMs);
+        session.bandwidth = session.bandwidth
+          ? Math.round(session.bandwidth * 0.35 + measured * 0.65)
+          : measured;
+      }
     });
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
       session.networkRecoveries = 0; session.mediaRecoveries = 0;
@@ -822,7 +808,7 @@ async function playWithDash(session) {
   session.engine = 'dash.js';
   emit(session.video, 'engine', { engine: 'dash.js' });
   const profile = deviceProfile();
-  session.bufferTarget = profile.startupBuffer;
+  session.bufferTarget = profile.targetBuffer;
   player.updateSettings({ streaming: {
     abr: {
       autoSwitchBitrate: { video: true, audio: true },
@@ -831,9 +817,9 @@ async function playWithDash(session) {
       useDeadTimeLatency: true,
     },
     buffer: {
-      bufferTimeDefault: profile.startupBuffer,
-      bufferTimeAtTopQuality: profile.startupBuffer,
-      bufferTimeAtTopQualityLongForm: profile.midBuffer,
+      bufferTimeDefault: profile.targetBuffer,
+      bufferTimeAtTopQuality: profile.targetBuffer,
+      bufferTimeAtTopQualityLongForm: profile.maxBuffer,
       bufferToKeep: profile.backBuffer,
       fastSwitchEnabled: true,
     },
@@ -860,13 +846,6 @@ async function playWithDash(session) {
         applyResume(session);
         session.autoplayBlocked = !(await safePlay(session.video));
         await waitForFirstFrame(session, 14000);
-        scheduleBufferRamp(session, 'dash.js', profile, target => {
-          player.updateSettings({ streaming: { buffer: {
-            bufferTimeDefault: target,
-            bufferTimeAtTopQuality: target,
-            bufferTimeAtTopQualityLongForm: Math.max(target, profile.maxBuffer),
-          } } });
-        });
         finish();
       } catch (error) { finish(error); }
     });
