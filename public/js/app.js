@@ -1,6 +1,6 @@
-import { api } from './api.js?v=1.2.2';
-import { store } from './storage.js?v=1.2.2';
-import { buildPersonalizedHome } from './recommend.js?v=1.2.2';
+import { api } from './api.js?v=1.2.3';
+import { store } from './storage.js?v=1.2.3';
+import { buildPersonalizedHome } from './recommend.js?v=1.2.3';
 
 const $ = selector => document.querySelector(selector);
 const els = {
@@ -115,8 +115,8 @@ async function ensurePlayerModules() {
   if (playerApi && playerUI) return playerApi;
   if (!playerModulesPromise) {
     playerModulesPromise = Promise.all([
-      import('./player.js?v=1.2.2'),
-      import('./player-ui.js?v=1.2.2'),
+      import('./player.js?v=1.2.3'),
+      import('./player-ui.js?v=1.2.3'),
     ]).then(([apiModule, uiModule]) => {
       playerApi = apiModule;
       playerUI = uiModule.createPlayerUI({
@@ -261,16 +261,56 @@ document.addEventListener('error', event => {
 }, true);
 
 function keyOf(item) { return item?.key || `${item?.provider || 'item'}:${item?.id || titleOf(item)}`; }
-function titleOf(item) { return item?.name || item?.title || '未命名'; }
+function rawTitleOf(item) { return String(item?.name || item?.title || '').trim(); }
+function isPlaceholderTitle(value = '') {
+  return /^(?:未命名|未知|无标题|untitled|unknown|n\/?a)$/iu.test(String(value || '').trim());
+}
+function titleOf(item) {
+  const value = rawTitleOf(item);
+  return value && !isPlaceholderTitle(value) ? value : '未命名';
+}
 function normalizeTitle(value = '') {
   return String(value).normalize('NFKC').toLowerCase().replace(/[\s\-_:：·•.，,()（）\[\]【】]/g, '').replace(/第?[一二三四五六七八九十0-9]+季$/u, '');
 }
-function canonicalItem(item) {
+function firstValue(items, selector) {
+  for (const item of items) {
+    const value = selector(item);
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+function firstRealTitle(items) {
+  for (const item of items) {
+    const value = rawTitleOf(item);
+    if (value && !isPlaceholderTitle(value)) return value;
+  }
+  return '';
+}
+function canonicalItem(...items) {
+  const valid = items.filter(Boolean);
+  const primary = valid[0] || {};
+  const name = firstRealTitle(valid);
+  const pic = firstValue(valid, item => item?.pic || item?.poster || item?.tmdb?.poster || item?.douban?.poster);
+  const backdrop = firstValue(valid, item => item?.backdrop || item?.tmdb?.backdrop);
+  const sources = firstValue(valid, item => Array.isArray(item?.sources) && item.sources.length ? item.sources : undefined);
   return {
-    key: keyOf(item), id: item?.id, provider: item?.provider, providerName: item?.providerName,
-    name: titleOf(item), pic: item?.pic || item?.poster, remarks: item?.remarks,
-    year: item?.year, type: item?.type, mediaType: item?.mediaType,
-    sources: item?.sources, tmdb: item?.tmdb, douban: item?.douban,
+    key: firstValue(valid, item => item?.key) || keyOf(primary),
+    id: firstValue(valid, item => item?.id),
+    provider: firstValue(valid, item => item?.provider),
+    providerName: firstValue(valid, item => item?.providerName),
+    ...(name ? { name } : {}),
+    ...(pic ? { pic, poster: pic } : {}),
+    ...(backdrop ? { backdrop } : {}),
+    remarks: firstValue(valid, item => item?.remarks),
+    year: firstValue(valid, item => item?.year),
+    type: firstValue(valid, item => item?.type),
+    mediaType: firstValue(valid, item => item?.mediaType),
+    ...(sources ? { sources } : {}),
+    tmdb: firstValue(valid, item => item?.tmdb),
+    douban: firstValue(valid, item => item?.douban),
+    rating: firstValue(valid, item => item?.rating),
+    popularity: firstValue(valid, item => item?.popularity),
+    votes: firstValue(valid, item => item?.votes),
   };
 }
 
@@ -841,7 +881,7 @@ async function openDetail(item, sourceOverride = null, options = {}) {
     const detail = payload.item;
     const canonicalKey = item.key || detail.key;
     detail.canonicalKey = canonicalKey;
-    const mergedItem = { ...item, provider: detail.provider, id: detail.id, providerName: detail.providerName, key: canonicalKey };
+    const mergedItem = { ...canonicalItem(detail, item), provider: detail.provider, id: detail.id, providerName: detail.providerName, key: canonicalKey };
     currentDetailContext = { item: mergedItem, detail, source };
     renderDetail(mergedItem, detail);
     return detail;
@@ -1170,7 +1210,7 @@ async function openPlayer(detail, episode, options = {}) {
     sequence,
     canonicalKey,
     sourceItem: { ...sourceItem, key: canonicalKey },
-    item: { ...canonicalItem(sourceItem), key: canonicalKey },
+    item: { ...canonicalItem(detail, sourceItem), key: canonicalKey },
     baseDetail: detail,
     detail,
     episode,
@@ -1203,13 +1243,20 @@ function saveHistory(position = els.player.currentTime || 0, duration = els.play
   if (!currentPlayback || !settings.recordHistory) return;
   const candidate = currentPlayback.currentCandidate;
   const episode = candidate?.episode || currentPlayback.episode;
+  const metadata = canonicalItem(
+    candidate?.detail,
+    currentPlayback.detail,
+    currentPlayback.baseDetail,
+    currentPlayback.item,
+    currentPlayback.sourceItem,
+  );
   const record = {
-    ...currentPlayback.item,
+    ...metadata,
     provider: candidate?.detail?.provider || currentPlayback.detail.provider,
     providerName: candidate?.detail?.providerName || currentPlayback.detail.providerName,
     id: candidate?.detail?.id || currentPlayback.detail.id,
     key: currentPlayback.canonicalKey,
-    sources: currentPlayback.sourceItem.sources,
+    sources: currentPlayback.sourceItem.sources || metadata.sources,
     episodeName: episode?.name || '',
     lineIndex: candidate?.lineIndex ?? currentPlayback.preferred.lineIndex,
     episodeIndex: candidate?.episodeIndex ?? currentPlayback.preferred.episodeIndex,
@@ -1574,6 +1621,94 @@ window.addEventListener('unhandledrejection', event => {
   toast(event.reason?.message || '页面发生未处理错误', 'error');
 });
 
+
+let historyRepairPromise = null;
+
+function historyNeedsMetadata(item) {
+  const name = rawTitleOf(item);
+  const hasImage = Boolean(item?.pic || item?.poster || item?.backdrop || item?.tmdb?.poster || item?.tmdb?.backdrop || item?.douban?.poster);
+  return !name || isPlaceholderTitle(name) || !hasImage;
+}
+
+function historyContentIdentity(item) {
+  const tmdbId = String(item?.tmdb?.id || item?.tmdbId || '').trim();
+  if (tmdbId) return `tmdb:${tmdbId}`;
+  const doubanId = String(item?.douban?.id || item?.doubanId || '').trim();
+  if (doubanId) return `douban:${doubanId}`;
+  const title = normalizeTitle(rawTitleOf(item));
+  const year = String(item?.year || '').match(/(?:19|20)\d{2}/)?.[0] || '';
+  const kind = String(item?.mediaType || item?.type || '').toLowerCase();
+  return title && year ? `title:${title}:${year}:${kind}` : '';
+}
+
+function richerHistoryMetadata(primary, secondary) {
+  const latest = Number(primary?.watchedAt || 0) >= Number(secondary?.watchedAt || 0) ? primary : secondary;
+  const other = latest === primary ? secondary : primary;
+  return {
+    ...other,
+    ...latest,
+    ...canonicalItem(latest, other),
+    key: latest.key,
+    position: latest.position,
+    duration: latest.duration,
+    lineIndex: latest.lineIndex,
+    episodeIndex: latest.episodeIndex,
+    episodeName: latest.episodeName,
+    url: latest.url,
+    watchedAt: latest.watchedAt,
+  };
+}
+
+async function repairHistoryMetadata() {
+  if (historyRepairPromise) return historyRepairPromise;
+  historyRepairPromise = (async () => {
+    const original = store.history();
+    const broken = original.filter(item => historyNeedsMetadata(item) && item?.provider && item?.id).slice(0, 8);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(2, broken.length) }, async () => {
+      while (cursor < broken.length) {
+        const item = broken[cursor++];
+        try {
+          const payload = await api.detail(item.provider, item.id);
+          const detail = payload?.item;
+          if (!detail) continue;
+          store.repairHistory({
+            ...item,
+            ...canonicalItem(detail, item),
+            key: item.key,
+            provider: item.provider || detail.provider,
+            providerName: item.providerName || detail.providerName,
+            id: item.id || detail.id,
+            watchedAt: item.watchedAt,
+          });
+        } catch {}
+      }
+    });
+    await Promise.all(workers);
+
+    const latest = store.history().sort((a, b) => Number(b?.watchedAt || 0) - Number(a?.watchedAt || 0));
+    const byIdentity = new Map();
+    for (const item of latest) {
+      const identity = historyContentIdentity(item);
+      if (!identity) continue;
+      const existing = byIdentity.get(identity);
+      if (!existing) {
+        byIdentity.set(identity, item);
+        continue;
+      }
+      const merged = richerHistoryMetadata(existing, item);
+      const removed = merged.key === existing.key ? item : existing;
+      const kept = merged.key === existing.key ? merged : richerHistoryMetadata(item, existing);
+      store.repairHistory(kept);
+      if (removed?.key && removed.key !== kept.key) store.deleteHistory(removed.key);
+      byIdentity.set(identity, kept);
+    }
+    await store.flush();
+    return true;
+  })().finally(() => { historyRepairPromise = null; });
+  return historyRepairPromise;
+}
+
 async function loadHealth() {
   try {
     const health = await api.health();
@@ -1598,7 +1733,10 @@ async function loadHealth() {
   idle(() => loadHealth().catch(() => {}), 900);
   idle(() => {
     store.ready()
-      .then(() => idle(() => refreshPersonalizedHome(), 700))
+      .then(async () => {
+        await repairHistoryMetadata().catch(() => {});
+        idle(() => refreshPersonalizedHome(), 500);
+      })
       .catch(() => {});
   }, 1200);
 })();

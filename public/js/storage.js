@@ -272,6 +272,27 @@ export const store = {
     replaceHistoryLocal(next);
     queueRemote({ type: 'history', item: record });
   },
+  repairHistory(item) {
+    if (!item?.key) return;
+    const existing = historyMap.get(item.key) || {};
+    const record = {
+      ...existing,
+      ...item,
+      watchedAt: Number(item.watchedAt || existing.watchedAt || Date.now()),
+    };
+    const next = state.history.filter(entry => entry.key !== item.key);
+    next.push(record);
+    next.sort((a, b) => Number(b?.watchedAt || 0) - Number(a?.watchedAt || 0));
+    replaceHistoryLocal(next);
+    queueRemote({ type: 'history', item: record });
+  },
+  deleteHistory(key) {
+    const value = String(key || '').trim();
+    if (!value || !historyMap.has(value)) return false;
+    replaceHistoryLocal(state.history.filter(entry => entry.key !== value));
+    queueRemote({ type: 'history-delete', key: value });
+    return true;
+  },
   addHistory(item) { this.upsertHistory(item); },
   updateProgress(key, position, duration, url, extra = {}) {
     const existing = historyMap.get(key);

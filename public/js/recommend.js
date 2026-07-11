@@ -10,8 +10,13 @@ function text(value = '') {
   return String(value || '').normalize('NFKC').trim();
 }
 
+function isPlaceholderTitle(value = '') {
+  return /^(?:未命名|未知|无标题|untitled|unknown|n\/?a)$/iu.test(text(value));
+}
+
 function titleOf(item) {
-  return text(item?.name || item?.title || '');
+  const value = text(item?.name || item?.title || '');
+  return value && !isPlaceholderTitle(value) ? value : '';
 }
 
 function keyOf(item) {
@@ -58,6 +63,101 @@ function completionOf(item) {
   return duration > 0 ? Math.max(0, Math.min(1, position / duration)) : 0;
 }
 
+function normalizedTitle(item) {
+  return titleOf(item)
+    .toLowerCase()
+    .replace(/[\s\-_:：·•.，,()（）\[\]【】'"“”‘’]/gu, '')
+    .replace(/第?[一二三四五六七八九十0-9]+季$/u, '');
+}
+
+function contentIdentity(item) {
+  const tmdbId = text(item?.tmdb?.id || item?.tmdbId || '');
+  if (tmdbId) return `tmdb:${tmdbId}`;
+  const doubanId = text(item?.douban?.id || item?.doubanId || '');
+  if (doubanId) return `douban:${doubanId}`;
+  const title = normalizedTitle(item);
+  const year = String(item?.year || '').match(/(?:19|20)\d{2}/)?.[0] || '';
+  if (title && year) return `title:${title}:${year}:${kindOf(item)}`;
+  return '';
+}
+
+function sourceAliases(item) {
+  const values = new Set();
+  const key = keyOf(item);
+  if (key) values.add(`key:${key}`);
+  if (item?.provider && item?.id) values.add(`source:${item.provider}:${item.id}`);
+  for (const source of Array.isArray(item?.sources) ? item.sources : []) {
+    if (source?.provider && source?.id) values.add(`source:${source.provider}:${source.id}`);
+  }
+  const identity = contentIdentity(item);
+  if (identity) values.add(identity);
+  return [...values];
+}
+
+function firstValue(items, selector) {
+  for (const item of items) {
+    const value = selector(item);
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function mergeSources(...groups) {
+  const map = new Map();
+  for (const source of groups.flatMap(group => Array.isArray(group) ? group : [])) {
+    if (!source?.provider || !source?.id) continue;
+    const id = `${source.provider}:${source.id}`;
+    if (!map.has(id)) map.set(id, source);
+  }
+  return [...map.values()];
+}
+
+function mergeMediaMetadata(playback, catalog) {
+  const items = [playback, catalog].filter(Boolean);
+  const name = firstValue(items, item => titleOf(item));
+  const pic = firstValue(items, item => item?.pic || item?.poster || item?.tmdb?.poster || item?.douban?.poster);
+  const backdrop = firstValue(items, item => item?.backdrop || item?.tmdb?.backdrop);
+  const sources = mergeSources(playback?.sources, catalog?.sources);
+  return {
+    ...(catalog || {}),
+    ...(playback || {}),
+    ...(name ? { name } : {}),
+    ...(pic ? { pic, poster: pic } : {}),
+    ...(backdrop ? { backdrop } : {}),
+    ...(sources.length ? { sources } : {}),
+    tmdb: playback?.tmdb || catalog?.tmdb,
+    douban: playback?.douban || catalog?.douban,
+    year: playback?.year || catalog?.year,
+    type: playback?.type || catalog?.type,
+    mediaType: playback?.mediaType || catalog?.mediaType,
+    rating: playback?.rating || catalog?.rating,
+    popularity: playback?.popularity || catalog?.popularity,
+    votes: playback?.votes || catalog?.votes,
+  };
+}
+
+function buildCatalogIndex(items) {
+  const index = new Map();
+  for (const item of items) {
+    for (const alias of sourceAliases(item)) {
+      if (!index.has(alias)) index.set(alias, item);
+    }
+  }
+  return index;
+}
+
+function hydrateHistory(history, pool) {
+  const index = buildCatalogIndex(pool);
+  return (history || []).map(item => {
+    let match = null;
+    for (const alias of sourceAliases(item)) {
+      match = index.get(alias);
+      if (match) break;
+    }
+    return match ? mergeMediaMetadata(item, match) : item;
+  });
+}
+
 function ageWeight(timestamp, halfLifeDays = 45) {
   const value = Number(timestamp || 0);
   if (!value) return 0.45;
@@ -74,12 +174,11 @@ function buildProfile(history, favorites) {
   const profile = new Map();
   const seen = new Set();
   for (const item of favorites || []) {
-    seen.add(keyOf(item));
+    for (const alias of sourceAliases(item)) seen.add(alias);
     addFeatureWeights(profile, item, 6.5 * ageWeight(item?.watchedAt || item?.updatedAt, 90));
   }
   for (const item of history || []) {
-    const key = keyOf(item);
-    seen.add(key);
+    for (const alias of sourceAliases(item)) seen.add(alias);
     const completion = completionOf(item);
     const seconds = Number(item?.position || 0);
     const recency = ageWeight(item?.watchedAt, 35);
@@ -133,7 +232,7 @@ function affinityScore(item, profile) {
 function reasonFor(item, affinity) {
   if (affinity?.best?.startsWith('genre:') && affinity.bestValue > 0.8) return `因为你常看${affinity.best.slice(6)}`;
   if (affinity?.best?.startsWith('kind:') && affinity.bestValue > 0.8) return `因为你常看${KIND_LABELS[affinity.best.slice(5)] || '这类内容'}`;
-  if (affinity?.best?.startsWith('decade:') && affinity.bestValue > 1.2) return `符合你的年代偏好`;
+  if (affinity?.best?.startsWith('decade:') && affinity.bestValue > 1.2) return '符合你的年代偏好';
   const rating = Number(item?.rating || item?.tmdb?.rating || item?.douban?.rating || 0);
   if (rating >= 8) return '高分口碑精选';
   return '为你探索的新内容';
@@ -178,22 +277,34 @@ function candidatePool(sections) {
   const map = new Map();
   for (const section of sections || []) {
     for (const item of section?.items || []) {
-      const key = keyOf(item);
-      if (!key || map.has(key)) continue;
-      map.set(key, item);
+      const identity = contentIdentity(item) || keyOf(item);
+      if (!identity || map.has(identity)) continue;
+      map.set(identity, item);
     }
   }
   return [...map.values()];
 }
 
+function mergeDuplicateHistory(existing, incoming) {
+  const latest = Number(existing?.watchedAt || 0) >= Number(incoming?.watchedAt || 0) ? existing : incoming;
+  const older = latest === existing ? incoming : existing;
+  return mergeMediaMetadata(latest, older);
+}
+
 function continueWatching(history, limit = 14) {
-  return [...(history || [])]
-    .filter(item => {
-      const duration = Number(item?.duration || 0);
-      const position = Number(item?.position || 0);
-      const ratio = completionOf(item);
-      return keyOf(item) && titleOf(item) && position >= 45 && duration >= 180 && ratio < 0.94;
-    })
+  const deduped = new Map();
+  const sorted = [...(history || [])].sort((a, b) => Number(b?.watchedAt || 0) - Number(a?.watchedAt || 0));
+  for (const item of sorted) {
+    const duration = Number(item?.duration || 0);
+    const position = Number(item?.position || 0);
+    const ratio = completionOf(item);
+    const title = titleOf(item);
+    if (!keyOf(item) || !title || position < 45 || duration < 180 || ratio >= 0.94) continue;
+    const identity = contentIdentity(item) || keyOf(item);
+    if (deduped.has(identity)) deduped.set(identity, mergeDuplicateHistory(deduped.get(identity), item));
+    else deduped.set(identity, item);
+  }
+  return [...deduped.values()]
     .sort((a, b) => Number(b?.watchedAt || 0) - Number(a?.watchedAt || 0))
     .slice(0, limit)
     .map(item => ({
@@ -203,27 +314,35 @@ function continueWatching(history, limit = 14) {
     }));
 }
 
+function overlapsAliases(item, aliases) {
+  return sourceAliases(item).some(alias => aliases.has(alias));
+}
+
 export function buildPersonalizedHome(sections, history = [], favorites = [], options = {}) {
   const baseSections = Array.isArray(sections) ? sections.filter(section => Array.isArray(section?.items)) : [];
   if (options.enabled === false) return baseSections;
   const output = [];
-  const resume = continueWatching(history, options.continueLimit || 14);
+  const pool = candidatePool(baseSections);
+  const hydratedHistory = hydrateHistory(history, pool);
+  const resume = continueWatching(hydratedHistory, options.continueLimit || 14);
   if (resume.length) output.push({ id: 'continue', title: '继续观看', kicker: 'CONTINUE', personalized: true, items: resume });
 
-  const pool = candidatePool(baseSections);
-  const { profile, seen } = buildProfile(history, favorites);
-  const completed = new Set((history || []).filter(item => completionOf(item) >= 0.9).map(keyOf));
+  const activeResumeAliases = new Set(resume.flatMap(sourceAliases));
+  const { profile, seen } = buildProfile(hydratedHistory, favorites);
+  const completedAliases = new Set(
+    hydratedHistory.filter(item => completionOf(item) >= 0.9).flatMap(sourceAliases),
+  );
   const scored = [];
   for (const item of pool) {
     const key = keyOf(item);
-    if (!key || completed.has(key)) continue;
+    if (!key || overlapsAliases(item, completedAliases) || overlapsAliases(item, activeResumeAliases)) continue;
     const affinity = affinityScore(item, profile);
-    const seenPenalty = seen.has(key) ? 3.4 : 0;
+    const seenPenalty = overlapsAliases(item, seen) ? 3.4 : 0;
     const exploration = profile.size ? 0 : 1.8;
     const score = qualityScore(item)
       + affinity.score * 0.72
       + exploration
-      + dailyNoise(key) * 1.2
+      + dailyNoise(contentIdentity(item) || key) * 1.2
       - seenPenalty;
     scored.push({ item, score, affinity, features: featuresOf(item) });
   }
