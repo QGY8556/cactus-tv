@@ -1846,3 +1846,77 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
 }
 .streamflow-clear:disabled,
 .streamflow-panel-head button:disabled { opacity: .45; cursor: wait; }
+
+/* CactusStreamflow player performance panel */
+.player-streamflow {
+  position: absolute;
+  z-index: 10;
+  top: max(14px, env(safe-area-inset-top));
+  right: max(14px, env(safe-area-inset-right));
+  left: auto;
+  width: min(310px, calc(100% - 92px));
+  padding: 10px 12px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  background: rgba(8,8,10,.76);
+  box-shadow: 0 10px 28px rgba(0,0,0,.28);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  pointer-events: none;
+  transition: opacity .2s ease, transform .2s ease;
+}
+.player-streamflow.hidden { display: none; }
+.player-streamflow-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.player-streamflow-head strong {
+  font-size: 12px;
+  letter-spacing: .02em;
+}
+.player-streamflow-head span {
+  font-size: 11px;
+  color: #8df3ad;
+  white-space: nowrap;
+}
+.player-streamflow > small {
+  display: block;
+  margin-top: 5px;
+  color: rgba(255,255,255,.68);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.player-streamflow-progress {
+  height: 3px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255,255,255,.12);
+}
+.player-streamflow-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: currentColor;
+  color: #61d887;
+  transition: width .25s ease;
+}
+.video-shell:not(.controls-visible) .player-streamflow.streamflow-ready {
+  opacity: .58;
+  transform: scale(.98);
+  transform-origin: top right;
+}
+@media (max-width: 640px) {
+  .player-streamflow {
+    top: auto;
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(72px, calc(env(safe-area-inset-bottom) + 66px));
+    left: auto;
+    width: min(270px, calc(100% - 20px));
+    padding: 8px 10px;
+  }
+  .player-streamflow > small { font-size: 10px; }
+}
