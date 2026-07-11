@@ -226,24 +226,6 @@ dialog { color: var(--text); }
 .player-gesture small { overflow: hidden; color: rgba(255,255,255,.72); font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .player-gesture-meter { height: 4px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.18); }
 .player-gesture-meter i { display: block; height: 100%; border-radius: inherit; background: #fff; transform-origin: left center; }
-/* Long-press 2× indicator: keep it out of the picture center and visually quiet. */
-.player-gesture.player-gesture-boost {
-  top: max(12px, calc(env(safe-area-inset-top, 0px) + 10px));
-  min-width: 0;
-  max-width: min(72vw, 260px);
-  gap: 1px;
-  padding: 7px 12px;
-  border-color: rgba(255,255,255,.07);
-  border-radius: 999px;
-  background: rgba(8,8,8,.38);
-  color: rgba(255,255,255,.76);
-  box-shadow: 0 3px 14px rgba(0,0,0,.2);
-  transform: translateX(-50%);
-  opacity: .82;
-}
-.player-gesture.player-gesture-boost strong { font-size: 13px; font-weight: 760; }
-.player-gesture.player-gesture-boost small { color: rgba(255,255,255,.5); font-size: 10px; }
-.player-gesture.player-gesture-boost .player-gesture-meter { display: none; }
 .player-tap-ripple { position: absolute; z-index: 6; width: 82px; height: 82px; display: grid; place-items: center; border: 2px solid rgba(255,255,255,.68); border-radius: 50%; background: rgba(0,0,0,.28); color: #fff; font-size: 17px; font-weight: 900; transform: translate(-50%,-50%) scale(.55); pointer-events: none; animation: cactus-tap-ripple .72s cubic-bezier(.2,.75,.2,1) forwards; }
 .player-tap-ripple-left { margin-left: -12px; }
 .player-tap-ripple-right { margin-left: 12px; }
@@ -1890,4 +1872,43 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
 }
 @supports not selector(:has(*)) {
   .recommend-reason { bottom: 12px; }
+}
+
+/* v1.1.3 gesture lifecycle: live controls, deterministic fade-out, and top-mounted boost hint. */
+.player-gesture {
+  opacity: 1;
+  transition: opacity .17s ease, transform .17s ease;
+  will-change: opacity, transform;
+}
+.player-gesture.is-fading {
+  opacity: 0;
+  transform: translate(-50%, calc(-50% - 6px));
+}
+.player-gesture[data-kind="boost"] {
+  top: max(16px, calc(env(safe-area-inset-top, 0px) + 12px));
+  min-width: 0;
+  max-width: min(72vw, 260px);
+  gap: 2px;
+  padding: 7px 12px;
+  border-color: rgba(255,255,255,.08);
+  border-radius: 999px;
+  background: rgba(0,0,0,.42);
+  color: rgba(255,255,255,.8);
+  box-shadow: 0 4px 14px rgba(0,0,0,.18);
+  opacity: .82;
+  transform: translateX(-50%);
+}
+.player-gesture[data-kind="boost"] strong { font-size: 12px; font-weight: 750; }
+.player-gesture[data-kind="boost"] small { color: rgba(255,255,255,.52); font-size: 9px; }
+.player-gesture[data-kind="boost"] .player-gesture-meter { display: none; }
+.player-gesture[data-kind="boost"].is-fading {
+  opacity: 0;
+  transform: translate(-50%, -5px);
+}
+@media (pointer: coarse) {
+  .player-gesture[data-kind="brightness"],
+  .player-gesture[data-kind="volume"] {
+    min-width: 132px;
+    background: rgba(8,8,8,.7);
+  }
 }
