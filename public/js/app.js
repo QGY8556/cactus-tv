@@ -1,5 +1,5 @@
-import { api } from './api.js?v=0.8.5';
-import { store } from './storage.js?v=0.8.5';
+import { api } from './api.js?v=0.8.6';
+import { store } from './storage.js?v=0.8.6';
 
 const $ = selector => document.querySelector(selector);
 const els = {
@@ -125,8 +125,8 @@ async function ensurePlayerModules() {
   if (playerApi && playerUI) return playerApi;
   if (!playerModulesPromise) {
     playerModulesPromise = Promise.all([
-      import('./player.js?v=0.8.5'),
-      import('./player-ui.js?v=0.8.5'),
+      import('./player.js?v=0.8.6'),
+      import('./player-ui.js?v=0.8.6'),
     ]).then(([apiModule, uiModule]) => {
       playerApi = apiModule;
       playerUI = uiModule.createPlayerUI({
@@ -762,24 +762,49 @@ function candidatesForDetail(detail, target, preferred = {}) {
       if (!exactPreferred && !sameEpisode) return;
       const url = episode.playbackUrl || episode.url;
       if (!url) return;
-      candidates.push({
+      const basePriority = exactPreferred ? -1000 : lineIndex;
+      const baseCandidate = {
         detail, episode, lineIndex, episodeIndex,
         lineName: line.name || `线路 ${lineIndex + 1}`,
         provider: detail.provider,
         providerName: detail.providerName,
         url,
-        priority: exactPreferred ? -1000 : lineIndex,
-      });
+        priority: basePriority,
+        transport: episode.proxied ? 'proxy' : 'direct',
+      };
+      candidates.push(baseCandidate);
+
+      // A proxy failure must never make the original playable URL disappear.
+      // Keep a direct candidate immediately behind the proxied candidate. The
+      // normal failover logic will use it only when the proxy path fails.
+      if (episode.proxied && episode.url && episode.url !== url) {
+        candidates.push({
+          ...baseCandidate,
+          url: episode.url,
+          priority: basePriority + 0.25,
+          transport: 'direct-fallback',
+        });
+      }
     });
   });
   if (!candidates.length) {
     const fallbackLine = detail.lines?.[0];
     const fallbackEpisode = fallbackLine?.episodes?.[target.index];
-    if (fallbackEpisode) candidates.push({
-      detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
-      lineName: fallbackLine.name || '线路 1', provider: detail.provider, providerName: detail.providerName,
-      url: fallbackEpisode.playbackUrl || fallbackEpisode.url, priority: 999,
-    });
+    if (fallbackEpisode) {
+      const fallbackUrl = fallbackEpisode.playbackUrl || fallbackEpisode.url;
+      candidates.push({
+        detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
+        lineName: fallbackLine.name || '线路 1', provider: detail.provider, providerName: detail.providerName,
+        url: fallbackUrl, priority: 999, transport: fallbackEpisode.proxied ? 'proxy' : 'direct',
+      });
+      if (fallbackEpisode.proxied && fallbackEpisode.url && fallbackEpisode.url !== fallbackUrl) {
+        candidates.push({
+          detail, episode: fallbackEpisode, lineIndex: 0, episodeIndex: target.index,
+          lineName: fallbackLine.name || '线路 1', provider: detail.provider, providerName: detail.providerName,
+          url: fallbackEpisode.url, priority: 999.25, transport: 'direct-fallback',
+        });
+      }
+    }
   }
   return candidates.sort((a, b) => {
     const preferred = a.priority - b.priority;
@@ -1047,8 +1072,6 @@ function proxiedStreamflowSource(candidate) {
       provider,
       sourceUrl,
       proxyUrl: url,
-      mediaTicket: url.searchParams.get('mt') || '',
-      mediaTicketExpires: Number(url.searchParams.get('mte') || 0),
     };
   } catch { return null; }
 }
@@ -1104,8 +1127,6 @@ async function prepareStreamflow(playback, candidate) {
     sourceUrl: source.sourceUrl,
     playUrl: `${playUrl.pathname}${playUrl.search}`,
     generation: streamflowGeneration,
-    mediaTicket: source.mediaTicket,
-    mediaTicketExpires: source.mediaTicketExpires,
   };
 }
 
@@ -1294,8 +1315,6 @@ async function sendStreamflowHeartbeat(phase = 'playing', keepalive = false, all
     phase,
     enabled: settings.streamflowEnabled !== false,
     generation: streamflow.generation || streamflowGeneration,
-    mediaTicket: streamflow.mediaTicket || '',
-    mediaTicketExpires: streamflow.mediaTicketExpires || 0,
   };
   playback.lastStreamflowSync = Date.now();
   playback.streamflowRequestInFlight = true;
