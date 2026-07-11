@@ -7,7 +7,7 @@ const required = [
   'public/vendor/hls.min.js', 'public/vendor/dash.all.min.js', 'functions/_middleware.ts', 'functions/_shared/auth.ts',
   'functions/api/health.ts', 'functions/api/subtitle.ts', 'functions/api/library.ts', 'functions/api/admin/providers.ts',
   'functions/api/cache/heartbeat.ts', 'functions/api/cache/status.ts', 'functions/api/cache/clear.ts',
-  'functions/_shared/streamflow.ts', 'functions/_shared/media-ticket.ts', 'migrations/0001_init.sql', 'migrations/0002_library.sql',
+  'functions/_shared/streamflow.ts', 'migrations/0001_init.sql', 'migrations/0002_library.sql',
   'CACTUS_STREAMFLOW.md', 'DEPLOY.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
 ];
 
@@ -68,13 +68,12 @@ try {
 } catch {}
 
 try {
-  const ticket = await readFile('functions/_shared/media-ticket.ts', 'utf8');
-  for (const token of ['issueMediaTicket', 'verifyMediaTicket', 'HMAC']) {
-    if (!ticket.includes(token)) failures.push(`短期媒体凭证实现缺少：${token}`);
-  }
   const app = await readFile('public/js/app.js', 'utf8');
-  for (const token of ['streamflowUnavailableReason', "textContent = '未启动'", 'mediaTicketExpires']) {
-    if (!app.includes(token)) failures.push(`Streamflow 状态面板实现缺少：${token}`);
+  for (const token of ['streamflowUnavailableReason', "textContent = '未启动'", 'direct-fallback']) {
+    if (!app.includes(token)) failures.push(`播放恢复与 Streamflow 状态实现缺少：${token}`);
+  }
+  for (const removed of ['mediaTicketExpires', "searchParams.get('mt')", "searchParams.get('mte')"]) {
+    if (app.includes(removed)) failures.push(`前端仍包含已撤销的动态媒体凭证逻辑：${removed}`);
   }
 } catch {}
 
