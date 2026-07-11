@@ -1,6 +1,5 @@
 import { cleanText, HttpError, ok, readJson } from '../../_shared/http';
 import { findProvider } from '../../_shared/providers';
-import { verifyMediaTicket } from '../../_shared/media-ticket';
 import {
   cacheWindow,
   finiteNumber,
@@ -27,8 +26,6 @@ type HeartbeatBody = {
   phase?: unknown;
   enabled?: unknown;
   generation?: unknown;
-  mediaTicket?: unknown;
-  mediaTicketExpires?: unknown;
 };
 
 export const onRequestPost: PagesFunction<Env, any, AppData> = async ({ request, env, waitUntil }) => {
@@ -48,13 +45,11 @@ export const onRequestPost: PagesFunction<Env, any, AppData> = async ({ request,
   if (!provider || !provider.enabled || !provider.proxyEnabled) {
     throw new HttpError(409, '该片源未启用受控代理，无法使用 CactusStreamflow', 'STREAMFLOW_PROXY_REQUIRED');
   }
-  const ticketAuthorized = await verifyMediaTicket(
-    env,
-    provider.id,
-    body.mediaTicketExpires,
-    body.mediaTicket,
-  );
-  const normalizedSource = providerAllowsUrl(provider, sourceUrl, ticketAuthorized).toString();
+
+  // Streamflow is intentionally restricted to explicit media-host allowlists.
+  // Unknown dynamic CDNs stay on direct playback so a failed Cloudflare fetch
+  // can never make an otherwise playable video unavailable.
+  const normalizedSource = providerAllowsUrl(provider, sourceUrl).toString();
 
   const position = Math.max(0, finiteNumber(body.position));
   const duration = Math.max(0, finiteNumber(body.duration));
@@ -80,7 +75,6 @@ export const onRequestPost: PagesFunction<Env, any, AppData> = async ({ request,
       position,
       duration,
       phase,
-      allowUnlisted: ticketAuthorized,
     }).catch(error => console.warn('CactusStreamflow prefetch failed', error)));
   }
 
