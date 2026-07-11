@@ -3,11 +3,12 @@ import { HttpError } from './http';
 import { fetchWithTimeout } from './providers';
 import type { Env, Provider } from './types';
 
-export const STREAMFLOW_MIN_RATIO = 1 / 3;
 export const STREAMFLOW_OVERLAP_SECONDS = 18;
 export const STREAMFLOW_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const STREAMFLOW_HINT_TTL_SECONDS = 24 * 60 * 60;
-export const STREAMFLOW_MAX_PREFETCH_OBJECTS = 12;
+export const STREAMFLOW_MAX_PREFETCH_OBJECTS = 9;
+export const STREAMFLOW_MIN_AHEAD_SECONDS = 600;
+export const STREAMFLOW_STATUS_TTL_SECONDS = 24 * 60 * 60;
 
 const GENERATION_SETTING = 'streamflow_cache_generation';
 const MAX_PLAYLIST_BYTES = 3_000_000;
@@ -33,6 +34,31 @@ type StreamflowHint = {
   provider: string;
   playlistUrl: string;
   trackId: string;
+};
+
+export type StreamflowPrefetchStatus = {
+  engine: 'cache-api';
+  state: 'idle' | 'running' | 'partial' | 'ready' | 'error';
+  phase: string;
+  trackId: string;
+  position: number;
+  duration: number;
+  targetStart: number;
+  targetEnd: number;
+  targetAheadSeconds: number;
+  cachedThrough: number;
+  cachedAheadSeconds: number;
+  complete: boolean;
+  batches: number;
+  segmentsReady: number;
+  lastBatchStored: number;
+  lastBatchHits: number;
+  lastBatchSkipped: number;
+  totalStored: number;
+  totalHits: number;
+  totalSkipped: number;
+  updatedAt: number;
+  lastError: string;
 };
 
 export type StreamflowPrefetchInput = {
@@ -70,11 +96,16 @@ export function finiteNumber(value: unknown, fallback = 0): number {
 }
 
 export function cacheWindow(position: number, duration: number): { eligible: boolean; start: number; end: number } {
-  if (!(duration > 0) || position / duration < STREAMFLOW_MIN_RATIO || position >= duration - 5) {
+  // The rolling window is a playback buffer, so it starts as soon as a finite
+  // duration is available. The old one-third threshold only made sense for
+  // long-lived R2 storage and would hide the benefit during normal playback.
+  if (!(duration > 0) || position >= duration - 5) {
     return { eligible: false, start: 0, end: 0 };
   }
   const start = Math.max(0, position - STREAMFLOW_OVERLAP_SECONDS);
-  const end = Math.min(duration, position + (duration - position) / 2);
+  const remaining = Math.max(0, duration - position);
+  const desiredAhead = Math.max(STREAMFLOW_MIN_AHEAD_SECONDS, remaining / 2);
+  const end = Math.min(duration, position + desiredAhead);
   return { eligible: end > start + 5, start, end };
 }
 
@@ -129,6 +160,78 @@ export function streamflowHintCacheRequest(origin: string, sessionId: string, ge
   if (!validStreamflowId(sessionId)) throw new HttpError(400, '缓存会话 ID 无效', 'STREAMFLOW_INVALID_ID');
   const url = new URL(`/__cactus_streamflow_hint/v${normalizeStreamflowGeneration(generation)}/${sessionId}`, origin);
   return new Request(url.toString(), { method: 'GET' });
+}
+
+
+export function streamflowStatusCacheRequest(origin: string, sessionId: string, generation: number): Request {
+  if (!validStreamflowId(sessionId)) throw new HttpError(400, '缓存会话 ID 无效', 'STREAMFLOW_INVALID_ID');
+  const url = new URL(`/__cactus_streamflow_status/v${normalizeStreamflowGeneration(generation)}/${sessionId}`, origin);
+  return new Request(url.toString(), { method: 'GET' });
+}
+
+export async function readStreamflowStatus(
+  origin: string,
+  sessionId: string,
+  generation: number,
+): Promise<StreamflowPrefetchStatus | null> {
+  if (!streamflowReady() || !validStreamflowId(sessionId)) return null;
+  const response = await caches.default.match(streamflowStatusCacheRequest(origin, sessionId, generation));
+  if (!response) return null;
+  try {
+    const status = await response.json<StreamflowPrefetchStatus>();
+    return status?.engine === 'cache-api' ? status : null;
+  } catch { return null; }
+}
+
+async function writeStreamflowStatus(
+  origin: string,
+  sessionId: string,
+  generation: number,
+  status: StreamflowPrefetchStatus,
+): Promise<void> {
+  if (!streamflowReady() || !validStreamflowId(sessionId)) return;
+  const response = new Response(JSON.stringify(status), {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': `public, max-age=${STREAMFLOW_STATUS_TTL_SECONDS}`,
+    },
+  });
+  await caches.default.put(streamflowStatusCacheRequest(origin, sessionId, generation), response);
+}
+
+export async function markStreamflowError(
+  origin: string,
+  sessionId: string,
+  generation: number,
+  error: unknown,
+): Promise<void> {
+  const previous = await readStreamflowStatus(origin, sessionId, generation);
+  const message = error instanceof Error ? error.message : String(error || '预取失败');
+  const now = Date.now();
+  await writeStreamflowStatus(origin, sessionId, generation, {
+    engine: 'cache-api',
+    state: 'error',
+    phase: previous?.phase || 'playing',
+    trackId: previous?.trackId || 'main',
+    position: previous?.position || 0,
+    duration: previous?.duration || 0,
+    targetStart: previous?.targetStart || 0,
+    targetEnd: previous?.targetEnd || 0,
+    targetAheadSeconds: previous?.targetAheadSeconds || 0,
+    cachedThrough: previous?.cachedThrough || 0,
+    cachedAheadSeconds: previous?.cachedAheadSeconds || 0,
+    complete: false,
+    batches: previous?.batches || 0,
+    segmentsReady: previous?.segmentsReady || 0,
+    lastBatchStored: 0,
+    lastBatchHits: 0,
+    lastBatchSkipped: 1,
+    totalStored: previous?.totalStored || 0,
+    totalHits: previous?.totalHits || 0,
+    totalSkipped: (previous?.totalSkipped || 0) + 1,
+    updatedAt: now,
+    lastError: message.slice(0, 300),
+  });
 }
 
 function cleanCachedHeaders(headers: Headers): Headers {
@@ -216,10 +319,10 @@ async function readStreamflowHint(origin: string, sessionId: string, generation:
   } catch { return null; }
 }
 
-async function fetchAllowed(provider: Provider, rawUrl: string, range = ''): Promise<Response> {
+async function fetchAllowed(provider: Provider, rawUrl: string, range = '', maxAttempts = 4): Promise<Response> {
   let current = providerAllowsUrl(provider, rawUrl);
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8', ...provider.requestHeaders });
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8.2', ...provider.requestHeaders });
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 14_000);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
@@ -231,7 +334,7 @@ async function fetchAllowed(provider: Provider, rawUrl: string, range = ''): Pro
 }
 
 async function fetchPlaylist(provider: Provider, rawUrl: string): Promise<{ text: string; url: URL }> {
-  const response = await fetchAllowed(provider, rawUrl);
+  const response = await fetchAllowed(provider, rawUrl, '', 2);
   if (!response.ok) throw new HttpError(502, `播放列表上游返回 HTTP ${response.status}`, 'STREAMFLOW_PLAYLIST_ERROR');
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PLAYLIST_BYTES) throw new HttpError(502, '播放列表过大', 'PLAYLIST_TOO_LARGE');
@@ -388,16 +491,14 @@ function parseMediaPlaylist(text: string, base: URL, trackId: string): PlannedSe
 }
 
 function prefetchLimit(phase: string): number {
-  if (phase === 'exit' || phase === 'hidden') return STREAMFLOW_MAX_PREFETCH_OBJECTS;
-  if (phase === 'paused') return 9;
-  return 7;
+  return STREAMFLOW_MAX_PREFETCH_OBJECTS;
 }
 
 async function cachePlannedObject(input: StreamflowPrefetchInput, object: PlannedObject): Promise<'hit' | 'stored' | 'skipped'> {
   const range = rangeHeader(object.range);
   const key = streamflowObjectCacheRequest(input.origin, input.sessionId, object.objectId, input.generation, range);
   if (await caches.default.match(key)) return 'hit';
-  const response = await fetchAllowed(input.provider, object.url, range);
+  const response = await fetchAllowed(input.provider, object.url, range, 2);
   if (!response.ok && response.status !== 206) return 'skipped';
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PREFETCH_OBJECT_BYTES) {
@@ -408,10 +509,42 @@ async function cachePlannedObject(input: StreamflowPrefetchInput, object: Planne
   return 'stored';
 }
 
-export async function prefetchStreamflow(input: StreamflowPrefetchInput): Promise<void> {
-  if (!streamflowReady() || !validStreamflowId(input.sessionId)) return;
+function emptyStatus(input: StreamflowPrefetchInput, window: { start: number; end: number }, previous: StreamflowPrefetchStatus | null): StreamflowPrefetchStatus {
+  const cachedThrough = Math.max(window.start, previous?.cachedThrough || window.start);
+  return {
+    engine: 'cache-api',
+    state: 'running',
+    phase: input.phase,
+    trackId: previous?.trackId || 'main',
+    position: input.position,
+    duration: input.duration,
+    targetStart: window.start,
+    targetEnd: window.end,
+    targetAheadSeconds: Math.max(0, window.end - input.position),
+    cachedThrough,
+    cachedAheadSeconds: Math.max(0, cachedThrough - input.position),
+    complete: false,
+    batches: previous?.batches || 0,
+    segmentsReady: previous?.segmentsReady || 0,
+    lastBatchStored: 0,
+    lastBatchHits: 0,
+    lastBatchSkipped: 0,
+    totalStored: previous?.totalStored || 0,
+    totalHits: previous?.totalHits || 0,
+    totalSkipped: previous?.totalSkipped || 0,
+    updatedAt: Date.now(),
+    lastError: '',
+  };
+}
+
+export async function prefetchStreamflow(input: StreamflowPrefetchInput): Promise<StreamflowPrefetchStatus | null> {
+  if (!streamflowReady() || !validStreamflowId(input.sessionId)) return null;
   const window = cacheWindow(input.position, input.duration);
-  if (!window.eligible) return;
+  if (!window.eligible) return null;
+
+  const previous = await readStreamflowStatus(input.origin, input.sessionId, input.generation);
+  let status = emptyStatus(input, window, previous);
+  await writeStreamflowStatus(input.origin, input.sessionId, input.generation, status);
 
   const hint = await readStreamflowHint(input.origin, input.sessionId, input.generation);
   let playlistUrl = hint?.provider === input.provider.id ? hint.playlistUrl : input.sourceUrl;
@@ -425,29 +558,89 @@ export async function prefetchStreamflow(input: StreamflowPrefetchInput): Promis
     playlist = await fetchPlaylist(input.provider, playlistUrl);
   }
 
-  const segments = parseMediaPlaylist(playlist.text, playlist.url, trackId)
+  const allSegments = parseMediaPlaylist(playlist.text, playlist.url, trackId)
     .filter(segment => segment.end >= window.start && segment.start <= window.end);
-  if (!segments.length) return;
+  if (!allSegments.length) {
+    status = { ...status, state: 'error', trackId, updatedAt: Date.now(), lastError: '播放列表中没有可预取的 HLS 分片' };
+    await writeStreamflowStatus(input.origin, input.sessionId, input.generation, status);
+    return status;
+  }
 
-  const planned: PlannedObject[] = [];
+  const targetEnd = Math.min(window.end, allSegments[allSegments.length - 1].end);
+
+  // A seek backwards or a rendition change resets the cursor to the new playback window.
+  const movedBack = previous && input.position + 90 < previous.position;
+  const trackChanged = previous && previous.trackId && previous.trackId !== trackId;
+  let cursor = Math.max(window.start, previous?.cachedThrough || window.start);
+  if (movedBack || trackChanged || cursor > targetEnd + 5) cursor = window.start;
+
+  const segmentStartIndex = allSegments.findIndex(segment => segment.end > cursor + 0.05);
+  const candidates = segmentStartIndex >= 0 ? allSegments.slice(segmentStartIndex) : [];
+  const objectBudget = prefetchLimit(input.phase);
   const seen = new Set<string>();
-  const push = (object?: PlannedObject) => {
-    if (!object || seen.has(object.objectId)) return;
-    seen.add(object.objectId);
-    planned.push(object);
-  };
-  for (const segment of segments) {
-    push(segment.map);
-    push(segment.key);
-    push(segment.object);
+  let objectCalls = 0;
+  let stored = 0;
+  let hits = 0;
+  let skipped = 0;
+  let readySegments = 0;
+  let cachedThrough = cursor;
+
+  for (const segment of candidates) {
+    const required = [segment.map, segment.key, segment.object]
+      .filter((object): object is PlannedObject => Boolean(object && !seen.has(object.objectId)));
+    if (!required.length) {
+      cachedThrough = Math.max(cachedThrough, segment.end);
+      readySegments += 1;
+      continue;
+    }
+    if (objectCalls + required.length > objectBudget) break;
+    required.forEach(object => seen.add(object.objectId));
+    objectCalls += required.length;
+
+    const results = await Promise.allSettled(required.map(object => cachePlannedObject(input, object)));
+    let segmentReady = true;
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        skipped += 1;
+        segmentReady = false;
+      } else if (result.value === 'stored') stored += 1;
+      else if (result.value === 'hit') hits += 1;
+      else {
+        skipped += 1;
+        segmentReady = false;
+      }
+    }
+    if (!segmentReady) break;
+    cachedThrough = Math.max(cachedThrough, segment.end);
+    readySegments += 1;
+    if (cachedThrough >= targetEnd - 0.25) break;
   }
 
-  const limit = prefetchLimit(input.phase);
-  let attempted = 0;
-  const scan = planned.slice(0, 72);
-  for (let index = 0; index < scan.length && attempted < limit; index += 3) {
-    const batch = scan.slice(index, index + 3);
-    const results = await Promise.allSettled(batch.map(object => cachePlannedObject(input, object)));
-    attempted += results.filter(result => result.status === 'fulfilled' && result.value !== 'hit').length;
-  }
+  const complete = cachedThrough >= targetEnd - 0.25;
+  status = {
+    ...status,
+    state: complete ? 'ready' : 'partial',
+    phase: input.phase,
+    trackId,
+    position: input.position,
+    duration: input.duration,
+    targetStart: window.start,
+    targetEnd,
+    targetAheadSeconds: Math.max(0, targetEnd - input.position),
+    cachedThrough,
+    cachedAheadSeconds: Math.max(0, cachedThrough - input.position),
+    complete,
+    batches: (previous?.batches || 0) + 1,
+    segmentsReady: (movedBack || trackChanged ? 0 : previous?.segmentsReady || 0) + readySegments,
+    lastBatchStored: stored,
+    lastBatchHits: hits,
+    lastBatchSkipped: skipped,
+    totalStored: (movedBack || trackChanged ? 0 : previous?.totalStored || 0) + stored,
+    totalHits: (movedBack || trackChanged ? 0 : previous?.totalHits || 0) + hits,
+    totalSkipped: (movedBack || trackChanged ? 0 : previous?.totalSkipped || 0) + skipped,
+    updatedAt: Date.now(),
+    lastError: skipped ? '部分分片暂时无法缓存，将在下一批重试' : '',
+  };
+  await writeStreamflowStatus(input.origin, input.sessionId, input.generation, status);
+  return status;
 }
