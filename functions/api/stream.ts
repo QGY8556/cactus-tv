@@ -4,9 +4,13 @@ import type { AppData, Env, Provider } from '../_shared/types';
 
 const PLAYLIST_LIMIT = 3_000_000;
 const SNIFF_LIMIT = 64 * 1024;
-const STRONG_AD_TOKEN = /(?:^|[\/_\-.?&=])(?:ads?|advert(?:isement)?s?|commercials?|promo(?:tion)?s?|pre-?roll|mid-?roll|post-?roll|casino|bet(?:ting)?|gambling|博彩|赌博)(?:[\/_\-.?&=]|$)/i;
-const AD_TEXT_TOKEN = /(?:广告|博彩|赌博|casino|gambling|advert(?:isement)?|commercial|pre-?roll|mid-?roll|post-?roll)/i;
-const AD_CUE_OUT = /^#EXT-X-(?:CUE-OUT(?:-CONT)?|SCTE35|OATCLS-SCTE35)\b/i;
+const STRONG_AD_TOKEN = /(?:^|[\/_\-.?&=])(?:ads?|advert(?:isement)?s?|commercials?|promo(?:tion)?s?|pre-?roll|mid-?roll|post-?roll|ad-?segment|ad-?break|ad-?pod|creative|placement|vast|vmap|ima|ssai|dai|stitched?-?ad|slate|casino|bet(?:ting)?|gambling|博彩|赌博)(?:[\/_\-.?&=]|$)/i;
+const AD_QUERY_KEY = /^(?:ad|ads|ad_?id|ad_?unit|advert|commercial|campaign|preroll|midroll|postroll|creative(?:id)?|placement(?:id)?|vast|vmap|ima|ssai|dai)$/i;
+const AD_HOST_TOKEN = /(?:^|\.)(?:ads?|adservice|adserver|adnxs|doubleclick|googlesyndication|googleads|imasdk|innovid|freewheel|spotx|springserve|pubads)(?:\.|$)/i;
+const AD_QUERY_VALUE = /^(?:1|true|yes|ad|ads|advert|commercial|preroll|midroll|postroll)$/i;
+const AD_QUERY_ID_KEY = /^(?:ad_?id|ad_?unit|campaign|creative(?:id)?|placement(?:id)?)$/i;
+const AD_CUE_OUT = /^#EXT-X-CUE-OUT(?:-CONT)?\b/i;
+const AD_SCTE_MARKER = /^#EXT-X-(?:SCTE35|OATCLS-SCTE35)\b/i;
 const AD_CUE_IN = /^#EXT-X-CUE-IN\b/i;
 
 function hostMatchesRule(hostname: string, rule: string): boolean {
@@ -31,160 +35,180 @@ function assertMediaUrl(provider: Provider, raw: string): URL {
   return url;
 }
 
-function proxied(provider: Provider, absolute: string, clean = false): string {
+type AdMeta = { reason: string; group: number } | null;
+
+function proxied(provider: Provider, absolute: string, clean = false, ad: AdMeta = null): string {
   const params = new URLSearchParams({ provider: provider.id, url: absolute });
   if (clean) params.set('clean', '1');
+  if (ad) {
+    params.set('cactus_ad', '1');
+    params.set('cactus_ad_reason', ad.reason);
+    params.set('cactus_ad_group', String(ad.group));
+  }
   return `/api/stream?${params.toString()}`;
+}
+
+function safeDecode(value: string): string {
+  try { return decodeURIComponent(value); }
+  catch { return value; }
+}
+
+function adReasonForUri(raw: string, base: URL): string {
+  const decoded = safeDecode(raw).toLowerCase();
+  if (STRONG_AD_TOKEN.test(decoded)) return 'url';
+  try {
+    const url = new URL(raw, base);
+    const target = safeDecode(`${url.pathname}${url.search}`).toLowerCase();
+    if (AD_HOST_TOKEN.test(url.hostname)) return 'host';
+    if (STRONG_AD_TOKEN.test(target)) return 'url';
+    for (const [key, value] of url.searchParams) {
+      if (AD_QUERY_KEY.test(key) && (AD_QUERY_ID_KEY.test(key) ? Boolean(value) : AD_QUERY_VALUE.test(value) || STRONG_AD_TOKEN.test(safeDecode(value)))) return 'query';
+    }
+  } catch {}
+  return '';
 }
 
 function isAdDateRange(line: string): boolean {
   if (!/^#EXT-X-DATERANGE:/i.test(line)) return false;
   return /(?:CLASS|ID)="[^"]*(?:ad|advert|commercial|interstitial|scte)[^"]*"/i.test(line)
     || /SCTE35-(?:OUT|CMD)=/i.test(line)
-    || /X-ASSET-URI=/i.test(line);
+    || /X-ASSET-(?:URI|LIST)=/i.test(line);
 }
 
-function hasImplicitAesIv(text: string): boolean {
-  return text.split(/\r?\n/).some(line => /^#EXT-X-KEY:/i.test(line)
-    && /METHOD=AES-128/i.test(line)
-    && !/\bIV=0x[0-9a-f]+/i.test(line));
+function isExternalInterstitial(line: string): boolean {
+  return /^#EXT-X-DATERANGE:/i.test(line)
+    && (/X-ASSET-(?:URI|LIST)=/i.test(line) || /CLASS="[^"]*interstitial[^"]*"/i.test(line));
 }
 
-function rewriteMediaSequence(lines: string[], leadingRemoved: number): string[] {
-  if (!leadingRemoved) return lines;
-  return lines.map(line => line.replace(/^#EXT-X-MEDIA-SEQUENCE:(\d+)\s*$/i, (_all, raw) => `#EXT-X-MEDIA-SEQUENCE:${Number(raw) + leadingRemoved}`));
+function attributeNumber(line: string, name: string): number {
+  const match = line.match(new RegExp(`(?:^|[:,])\\s*${name}=([0-9]+(?:\\.[0-9]+)?)`, 'i'));
+  const value = Number(match?.[1]);
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function cleanHlsPlaylist(text: string): { text: string; removed: number; applied: boolean; reason: string } {
-  if (!/#EXTINF:/i.test(text)) return { text, removed: 0, applied: false, reason: 'master-playlist' };
-  if (hasImplicitAesIv(text)) return { text, removed: 0, applied: false, reason: 'implicit-aes-iv' };
-  // Segment deletion is unsafe when the source already carries explicit timeline
-  // boundaries or byte-range/fMP4 state. Removing one of those boundaries can
-  // expose the MPEG-TS 33-bit timestamp wrap (~26.5h) to MSE and corrupt seeking.
-  if (/#EXT-X-(?:DISCONTINUITY(?:-SEQUENCE)?|MAP|BYTERANGE|PROGRAM-DATE-TIME)\b/i.test(text)) {
-    return { text, removed: 0, applied: false, reason: 'timeline-sensitive' };
+function cueDuration(line: string): number {
+  const direct = line.match(/^#EXT-X-CUE-OUT:\s*([0-9]+(?:\.[0-9]+)?)/i);
+  const value = Number(direct?.[1]);
+  return Number.isFinite(value) && value > 0 ? value : attributeNumber(line, 'DURATION');
+}
+
+function rewriteUriAttributes(rawLine: string, base: URL, provider: Provider, clean: boolean): string {
+  return rawLine.replace(/URI="([^"]+)"/g, (_all, uri) => {
+    try { return `URI="${proxied(provider, new URL(uri, base).toString(), clean)}"`; }
+    catch { return `URI="${uri}"`; }
+  });
+}
+
+function rewriteM3u8(text: string, base: URL, provider: Provider, clean: boolean): {
+  text: string;
+  marked: number;
+  interstitials: number;
+  cleanReason: string;
+} {
+  const mediaPlaylist = /#EXTINF:/i.test(text);
+  if (!mediaPlaylist) {
+    const master = text.split(/\r?\n/).map(rawLine => {
+      const trimmed = rawLine.trim();
+      if (!trimmed) return rawLine;
+      if (!trimmed.startsWith('#')) {
+        try { return proxied(provider, new URL(trimmed, base).toString(), clean); }
+        catch { return rawLine; }
+      }
+      return rewriteUriAttributes(rawLine, base, provider, clean);
+    }).join('\n');
+    return { text: master, marked: 0, interstitials: 0, cleanReason: clean ? 'master-playlist' : 'disabled' };
   }
 
-  const lines = text.split(/\r?\n/);
   const output: string[] = [];
-  let pending: string[] = [];
   let cueActive = false;
-  let cueWasExplicit = false;
-  let totalSegments = 0;
-  let removedSegments = 0;
-  let removedMarkers = 0;
-  let keptSegments = 0;
-  let leadingRemoved = 0;
-  let sawKeptSegment = false;
-  let insertDiscontinuity = false;
+  let timedAdRemaining = 0;
+  let pendingDuration = 0;
+  let waitingForSegmentUri = false;
+  let marked = 0;
+  let interstitials = 0;
+  let group = 0;
+  let previousWasAd = false;
+  const reasons = new Set<string>();
 
-  const flushNonSegmentPending = () => {
-    if (!pending.length) return;
-    output.push(...pending);
-    pending = [];
-  };
-
-  for (const rawLine of lines) {
+  for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
+
+    if (clean && isExternalInterstitial(line)) {
+      interstitials += 1;
+      reasons.add('interstitial');
+      continue;
+    }
 
     if (AD_CUE_OUT.test(line)) {
       cueActive = true;
-      cueWasExplicit = true;
-      removedMarkers += 1;
-      insertDiscontinuity = sawKeptSegment;
-      continue;
+      const duration = cueDuration(line);
+      if (duration > 0) timedAdRemaining = Math.max(timedAdRemaining, duration);
+      if (clean) { reasons.add('cue'); continue; }
     }
-    if (isAdDateRange(line)) {
-      // HLS interstitial signaling can be removed without deleting the main media timeline.
-      cueWasExplicit = true;
-      removedMarkers += 1;
-      continue;
+    if (AD_SCTE_MARKER.test(line)) {
+      const duration = attributeNumber(line, 'DURATION');
+      if (duration > 0) timedAdRemaining = Math.max(timedAdRemaining, duration);
+      if (clean) { reasons.add('scte'); continue; }
     }
     if (AD_CUE_IN.test(line)) {
       cueActive = false;
-      removedMarkers += 1;
-      insertDiscontinuity = sawKeptSegment;
+      timedAdRemaining = 0;
+      if (clean) continue;
+    }
+    if (clean && isAdDateRange(line)) {
+      const duration = attributeNumber(line, 'DURATION') || attributeNumber(line, 'PLANNED-DURATION');
+      if (duration > 0) timedAdRemaining = Math.max(timedAdRemaining, duration);
+      reasons.add('daterange');
       continue;
     }
 
     if (/^#EXTINF:/i.test(line)) {
-      flushNonSegmentPending();
-      pending = [rawLine];
+      const duration = Number(line.slice(line.indexOf(':') + 1).split(',')[0]);
+      pendingDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
+      waitingForSegmentUri = true;
+      output.push(rawLine);
       continue;
     }
 
-    if (pending.length) {
-      if (!line || line.startsWith('#')) {
-        pending.push(rawLine);
-        continue;
+    if (waitingForSegmentUri && line && !line.startsWith('#')) {
+      let reason = '';
+      if (clean) {
+        if (cueActive) reason = 'cue';
+        else if (timedAdRemaining > 0.01) reason = 'daterange';
+        else reason = adReasonForUri(line, base);
       }
-
-      totalSegments += 1;
-      const metadata = pending.join('\n');
-      const adByKeyword = STRONG_AD_TOKEN.test(line);
-      const shouldRemove = cueActive || adByKeyword;
-
-      if (shouldRemove) {
-        removedSegments += 1;
-        if (!sawKeptSegment) leadingRemoved += 1;
-        else insertDiscontinuity = true;
-        pending = [];
-        continue;
+      const isAd = Boolean(reason);
+      if (isAd && !previousWasAd) group += 1;
+      if (isAd) {
+        marked += 1;
+        reasons.add(reason);
       }
-
-      if (insertDiscontinuity && sawKeptSegment && !pending.some(item => /^#EXT-X-DISCONTINUITY\b/i.test(item.trim()))) {
-        output.push('#EXT-X-DISCONTINUITY');
-      }
-      output.push(...pending, rawLine);
-      pending = [];
-      insertDiscontinuity = false;
-      keptSegments += 1;
-      sawKeptSegment = true;
+      try {
+        output.push(proxied(provider, new URL(line, base).toString(), clean, isAd ? { reason, group } : null));
+      } catch { output.push(rawLine); }
+      if (timedAdRemaining > 0) timedAdRemaining = Math.max(0, timedAdRemaining - pendingDuration);
+      previousWasAd = isAd;
+      waitingForSegmentUri = false;
+      pendingDuration = 0;
       continue;
     }
 
-    // Remove ad signaling tags, while keeping normal HLS metadata untouched.
-    if (AD_CUE_OUT.test(line) || AD_CUE_IN.test(line) || isAdDateRange(line)) continue;
-    output.push(rawLine);
-  }
-
-  flushNonSegmentPending();
-  if (!removedSegments && removedMarkers) {
-    return { text: output.join('\n'), removed: 0, applied: true, reason: 'interstitial-marker' };
-  }
-  if (!removedSegments || totalSegments < 3 || keptSegments < 2) {
-    return { text, removed: 0, applied: false, reason: removedSegments ? 'too-few-segments' : 'no-match' };
-  }
-
-  const ratio = removedSegments / Math.max(1, totalSegments);
-  // Keyword matching is intentionally conservative. Explicit SCTE/CUE markers are trusted more.
-  if ((!cueWasExplicit && ratio > 0.28) || ratio > 0.45) {
-    return { text, removed: 0, applied: false, reason: 'safety-rollback' };
-  }
-
-  return {
-    text: rewriteMediaSequence(output, leadingRemoved).join('\n'),
-    removed: removedSegments,
-    applied: true,
-    reason: cueWasExplicit ? 'cue-marker' : 'strong-keyword',
-  };
-}
-
-function rewriteM3u8(text: string, base: URL, provider: Provider, clean: boolean): { text: string; removed: number; cleanReason: string } {
-  const cleaned = clean ? cleanHlsPlaylist(text) : { text, removed: 0, applied: false, reason: 'disabled' };
-  const rewritten = cleaned.text.split(/\r?\n/).map(rawLine => {
-    const trimmed = rawLine.trim();
-    if (!trimmed) return rawLine;
-    if (!trimmed.startsWith('#')) {
-      try { return proxied(provider, new URL(trimmed, base).toString(), clean); }
-      catch { return rawLine; }
+    if (line && !line.startsWith('#')) {
+      try { output.push(proxied(provider, new URL(line, base).toString(), clean)); }
+      catch { output.push(rawLine); }
+      previousWasAd = false;
+      continue;
     }
-    return rawLine.replace(/URI="([^"]+)"/g, (_all, uri) => {
-      try { return `URI="${proxied(provider, new URL(uri, base).toString(), clean)}"`; }
-      catch { return `URI="${uri}"`; }
-    });
-  }).join('\n');
-  return { text: rewritten, removed: cleaned.removed, cleanReason: cleaned.reason };
+
+    output.push(rewriteUriAttributes(rawLine, base, provider, clean));
+  }
+
+  const cleanReason = !clean
+    ? 'disabled'
+    : marked || interstitials
+      ? [...reasons].join(',') || 'marked'
+      : 'no-match';
+  return { text: output.join('\n'), marked, interstitials, cleanReason };
 }
 
 function escapeXml(value: string): string {
@@ -200,7 +224,7 @@ async function fetchRedirectSafe(provider: Provider, url: URL, request: Request)
   let current = url;
   for (let i = 0; i < 4; i += 1) {
     assertMediaUrl(provider, current.toString());
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/1.3.0', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/1.3.1', ...provider.requestHeaders });
     const range = request.headers.get('range');
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 15_000);
@@ -340,8 +364,9 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
         'cache-control': 'no-store, private',
         'access-control-allow-origin': '*',
         'x-cactus-media-kind': 'hls',
-        'x-cactus-cleanstream': clean ? (rewritten.removed ? 'FILTERED' : 'PASS') : 'OFF',
-        'x-cactus-cleanstream-removed': String(rewritten.removed),
+        'x-cactus-cleanstream': clean ? (rewritten.marked ? 'MARKED' : rewritten.interstitials ? 'INTERSTITIAL' : 'PASS') : 'OFF',
+        'x-cactus-cleanstream-marked': String(rewritten.marked),
+        'x-cactus-cleanstream-interstitials': String(rewritten.interstitials),
         'x-cactus-cleanstream-reason': rewritten.cleanReason,
       },
     });
