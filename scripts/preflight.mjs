@@ -34,7 +34,7 @@ try {
 
 try {
   const html = await readFile('public/index.html', 'utf8');
-  for (const ref of ['/styles.css?v=1.3.0', '/js/app.js?v=1.3.0']) {
+  for (const ref of ['/styles.css?v=1.3.1', '/js/app.js?v=1.3.1']) {
     if (!html.includes(ref)) failures.push(`首页缺少或未升级资源引用：${ref}`);
   }
   if (/登录 Cactus TV|loginForm|authDialog/.test(html)) failures.push('首页仍包含登录界面');
@@ -45,7 +45,7 @@ try {
 
 try {
   const app = await readFile('public/js/app.js', 'utf8');
-  for (const token of ['applyCleanStream', "import('./player.js?v=1.3.0')", "import('./player-ui.js?v=1.3.0')", 'buildPersonalizedHome']) {
+  for (const token of ['applyCleanStream', "import('./player.js?v=1.3.1')", "import('./player-ui.js?v=1.3.1')", 'buildPersonalizedHome']) {
     if (!app.includes(token)) failures.push(`前端主程序缺少：${token}`);
   }
   if (/sendStreamflowHeartbeat|prepareStreamflow|streamflowEnabled/.test(app)) failures.push('前端仍包含主动 Streamflow 逻辑');
@@ -60,7 +60,7 @@ try {
 
 try {
   const player = await readFile('public/js/player.js', 'utf8');
-  for (const token of ['maxBufferLength: profile.targetBuffer', 'memorySafeBuffer', 'requestSessionWakeLock', 'emergencyDownshift', 'capLevelOnFPSDrop', 'abrMaxWithRealBitrate', 'requestVideoFrameCallback', 'recoverVisualFreeze', 'scheduleSeekFrameVerification', 'consumeRecoveryBudget', 'retryStartupFragment', 'setTrustedDuration', 'MAX_REASONABLE_VOD_DURATION', 'MPEG_TS_WRAP_SECONDS', 'durationAnomaly']) {
+  for (const token of ['maxBufferLength: profile.targetBuffer', 'memorySafeBuffer', 'requestSessionWakeLock', 'emergencyDownshift', 'capLevelOnFPSDrop', 'abrMaxWithRealBitrate', 'requestVideoFrameCallback', 'recoverVisualFreeze', 'scheduleSeekFrameVerification', 'startPosition: -1', 'setTrustedDuration', 'scheduleSeekFrameVerification', 'skipMarkedAd']) {
     if (!player.includes(token)) failures.push(`Cactus Player 2.0 播放内核缺少：${token}`);
   }
 } catch {}
@@ -74,9 +74,10 @@ try {
 
 try {
   const stream = await readFile('functions/api/stream.ts', 'utf8');
-  for (const token of ['x-cactus-cleanstream', 'cleanHlsPlaylist', 'allowedHost', 'timeline-sensitive']) {
+  for (const token of ['x-cactus-cleanstream', 'x-cactus-cleanstream-marked', 'rewriteM3u8', 'cactus_ad', 'allowedHost']) {
     if (!stream.includes(token)) failures.push(`Cactus Clean Stream 缺少：${token}`);
   }
+  if (stream.includes('rewriteMediaSequence') || stream.includes('cleanHlsPlaylist')) failures.push('Clean Stream 2.0 不应删除分片或重写媒体序列');
 } catch {}
 
 try {

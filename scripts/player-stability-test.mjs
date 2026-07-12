@@ -7,6 +7,8 @@ const app = read('public/js/app.js');
 const ui = read('public/js/player-ui.js');
 const index = read('public/index.html');
 const legacy = read('public/js/app-legacy.js');
+const stream = read('functions/api/stream.ts');
+const storage = read('public/js/storage.js');
 
 function block(source, marker, nextMarker) {
   const start = source.indexOf(marker);
@@ -43,9 +45,18 @@ assert.ok(ui.includes('lastProgressPointerCommitAt'), '进度条必须抑制事�
 assert.ok(ui.includes('current > 12 * 60 * 60'), 'UI 不得展示 26/40 小时异常进度');
 assert.ok(ui.includes("if (event.detail?.recoverable !== false) { setState('recovering'); return; }"), '可恢复错误不得先闪硬错误');
 
-assert.match(index, /app\.js\?v=1\.3\.0/);
-assert.match(index, /app-legacy\.js\?v=1\.3\.0/);
+assert.match(index, /app\.js\?v=1\.3\.1/);
+assert.match(index, /app-legacy\.js\?v=1\.3\.1/);
 assert.ok(legacy.length > 100_000, '旧浏览器兼容包疑似未重建');
+
+assert.ok(stream.includes("params.set('cactus_ad', '1')"), 'Clean Stream 必须标记广告分片');
+assert.ok(stream.includes('x-cactus-cleanstream-marked'), 'Clean Stream 必须报告已标记分片');
+assert.ok(!stream.includes('rewriteMediaSequence'), 'Clean Stream 不得改写媒体序列');
+assert.ok(!stream.includes('cleanHlsPlaylist'), 'Clean Stream 不得通过删除分片实现去广告');
+assert.ok(player.includes('Hls.Events.FRAG_LOADING'), '播放器必须在广告分片加载前拦截');
+assert.ok(player.includes('skipMarkedAd(session, hls'), '播放器必须按连续广告组跳过');
+assert.ok(ui.includes("video.addEventListener('cactus:adskip'"), 'UI 必须展示实际广告跳过结果');
+assert.ok(storage.includes('cleanStreamEnabled: false'), '实验性去广告必须默认关闭');
 
 // Mirror the production playlist-duration decision with malformed start offsets.
 const finiteDuration = value => {
